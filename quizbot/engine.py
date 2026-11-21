@@ -53,14 +53,6 @@ def points_for(base, elapsed_ms, limit_ms, correct):
     return max(math.ceil(maximum/2),math.floor(maximum*(1-0.5*fraction)+0.5))
 
 
-def legacy_points_for(base, elapsed_ms, limit_ms, correct):
-    """Keep the rules of matches already started before the update."""
-    if not correct:
-        return 0
-    bonus = max(0, min(5, math.floor(5 * (1 - elapsed_ms / limit_ms) + 0.5)))
-    return base + bonus
-
-
 class Engine:
     def __init__(self, db, clock=time.time):
         self.db = db
@@ -247,22 +239,21 @@ class Engine:
 
     def open_question(self, gid, uid, position, opened_at):
         g = self.one('SELECT * FROM games WHERE game_id=?', (gid,))
-        self.db.execute("DELETE FROM outbox WHERE kind='question' AND game_id=? AND user_id=?", (gid,uid))
+        u = self.one('SELECT platform_user_id FROM users WHERE user_id=?', (uid,))
         if position > g['question_count']:
             self.db.execute('''UPDATE game_participants SET participant_status='finished',
                 question_deadline_at=NULL,finished_at=? WHERE game_id=? AND user_id=?''', (opened_at,gid,uid))
-            u = self.one('SELECT platform_user_id FROM users WHERE user_id=?', (uid,))
             self.send(u[0],'<b>Вы закончили отвечать</b>\nИтоги появятся здесь, когда закончат остальные игроки.',slot='room')
-            return
+            return None
         deadline = min(opened_at+g['question_time_limit_seconds'],g['hard_deadline_at'])
         self.db.execute('''UPDATE game_participants SET current_position=?,question_opened_at=?,
             question_deadline_at=?,question_delivered_at=NULL WHERE game_id=? AND user_id=?''', (position,opened_at,deadline,gid,uid))
-        u = self.one('SELECT platform_user_id FROM users WHERE user_id=?', (uid,))
         self.send(u[0],'',kind='question',game_id=gid,user_id=uid,position=position)
+        return deadline
 
     def answer(self, gid, uid, position, selected, received_at=None):
         now = self.clock() if received_at is None else received_at
-        p = self.one('''SELECT p.*,g.status,g.question_time_limit_seconds,g.scoring_version FROM game_participants p
+        p = self.one('''SELECT p.*,g.status FROM game_participants p
             JOIN games g USING(game_id) WHERE p.game_id=? AND p.user_id=?''', (gid,uid))
         if not p or p['status']!='in_progress' or p['participant_status']!='playing' or p['current_position']!=position:
             raise RuleError('Этот вопрос уже закрыт. Откройте текущий вопрос через /room.')
@@ -272,45 +263,37 @@ class Engine:
         q = self.one('SELECT * FROM game_questions WHERE game_id=? AND position=?', (gid,position))
         if not 0 <= selected < len(json.loads(q['options_snapshot'])):
             raise RuleError('Такого варианта ответа нет.')
-        if p['scoring_version']>=2 and p['question_delivered_at'] is None:
+        start = p['question_delivered_at']
+        if start is None:
             raise RuleError('Бот ещё обновляет вопрос. Подождите немного и нажмите ответ ещё раз.')
-        start = p['question_delivered_at'] if p['scoring_version']>=2 else p['question_opened_at']
         elapsed = max(0,round((now-start)*1000))
         correct = int(selected==q['correct_answer_snapshot'])
-        if p['scoring_version']>=2:
-            window_ms = max(0,round((p['question_deadline_at']-start)*1000))
-            score = points_for(q['base_points'],elapsed,window_ms,correct)
-        else:
-            score = legacy_points_for(q['base_points'],elapsed,p['question_time_limit_seconds']*1000,correct)
+        window_ms = max(0,round((p['question_deadline_at']-start)*1000))
+        score = points_for(q['base_points'],elapsed,window_ms,correct)
         self.db.execute('INSERT INTO answers VALUES(?,?,?,?,?,?,?,?,?)',
                         (gid,uid,position,'answered',selected,correct,elapsed,score,now))
         self.db.execute('''UPDATE game_participants SET total_score=total_score+?,correct_count=correct_count+?,
             total_response_ms=total_response_ms+? WHERE game_id=? AND user_id=?''', (score,correct,elapsed,gid,uid))
         self.open_question(gid,uid,position+1,now)
         self.finalize(gid)
-        return 'Верно! +'+format_count(score,'очко','очка','очков') if correct else 'Неверно. За этот ответ 0 очков.'
 
     def tick(self):
         now = self.clock()
         for g in self.all("SELECT * FROM games WHERE status='lobby' AND lobby_expires_at<=?", (now,)):
             self.cancel(g['game_id'],'Комната закрылась через 30 минут ожидания.')
-        due = self.all('''SELECT p.* FROM game_participants p JOIN games g USING(game_id)
+        due = self.all('''SELECT game_id,user_id,current_position,question_deadline_at,question_time_limit_seconds
+            FROM game_participants p JOIN games g USING(game_id)
             WHERE g.status='in_progress' AND p.participant_status='playing' AND p.question_deadline_at<=?''', (now,))
         affected = set()
-        for original in due:
-            gid,uid = original['game_id'],original['user_id']
-            while True:
-                p = self.one('SELECT * FROM game_participants WHERE game_id=? AND user_id=?', (gid,uid))
-                if p['participant_status']!='playing' or p['question_deadline_at']>now:
-                    break
-                deadline = p['question_deadline_at']
+        for gid,uid,position,deadline,seconds in due:
+            while deadline is not None and deadline<=now:
                 self.db.execute('INSERT INTO answers VALUES(?,?,?,?,?,?,?,?,?)',
-                                (gid,uid,p['current_position'],'timed_out',None,0,None,0,deadline))
-                g = self.one('SELECT question_time_limit_seconds FROM games WHERE game_id=?', (gid,))
+                                (gid,uid,position,'timed_out',None,0,None,0,deadline))
                 self.db.execute('UPDATE game_participants SET total_response_ms=total_response_ms+? WHERE game_id=? AND user_id=?',
-                                (g[0]*1000,gid,uid))
-                # Anchor to the old deadline, not recovery time: restarts cannot extend a test.
-                self.open_question(gid,uid,p['current_position']+1,deadline)
+                                (seconds*1000,gid,uid))
+                position += 1
+                # A delayed check must not extend the time allowed for the game.
+                deadline = self.open_question(gid,uid,position,deadline)
             affected.add(gid)
         for gid in affected:
             self.finalize(gid)
@@ -333,8 +316,9 @@ class Engine:
             previous=key(p)
         self.db.execute("UPDATE games SET status='completed',finished_at=? WHERE game_id=?", (self.clock(),gid))
         result = self.results(gid)
+        markup = keyboard([('История игр','history:0'),('Меню','menu')])
         for p in players:
-            self.send(p['platform_user_id'],result,keyboard([('Разобрать ответы','review:%s:1'%gid),('Мой профиль','profile')]),slot='room')
+            self.send(p['platform_user_id'],result,markup,slot='room')
 
     def owned_lobby(self, gid, owner_id):
         g=self.one('SELECT * FROM games WHERE game_id=?',(gid,))
@@ -405,7 +389,7 @@ class Engine:
         ''', (start_at, end_at))
 
     def question_payload(self, row):
-        p = self.one('''SELECT p.*,g.status,g.question_count,g.scoring_version,g.game_code FROM game_participants p
+        p = self.one('''SELECT p.*,g.status,g.question_count,g.game_code FROM game_participants p
             JOIN games g USING(game_id) WHERE p.game_id=? AND p.user_id=?''', (row['game_id'],row['user_id']))
         if not p or p['status']!='in_progress' or p['participant_status']!='playing' or p['current_position']!=row['position']:
             return None
@@ -420,12 +404,10 @@ class Engine:
                             (p['game_id'],p['user_id'],p['current_position']-1))
         if previous and previous[0]=='timed_out':
             timeout_note='⏰ Время на предыдущий вопрос вышло. За него 0 очков.'
-        scoring_note = ('За верный ответ в первые 10 секунд — максимум очков.' if p['scoring_version']>=2
-                        else 'За быстрый верный ответ — до 5 дополнительных очков.')
         lines = [f"<b>Вопрос {p['current_position']} из {p['question_count']}</b> · <code>{p['game_code']}</code>",
                  '',html.escape(q['question_snapshot']),'',
                  f"{DIFFICULTIES[q['difficulty_snapshot']]} сложность · до {q['base_points']+5} очков",
-                 f'Осталось {remaining} с. '+scoring_note]
+                 f'Осталось {remaining} с. За верный ответ в первые 10 секунд — максимум очков.']
         if timeout_note:
             lines.extend(['',timeout_note])
         return {'text':'\n'.join(lines),'parse_mode':'HTML','reply_markup':keyboard(*rows)}

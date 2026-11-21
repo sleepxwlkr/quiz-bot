@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from quizbot.app import Application
 from quizbot.db import ROOT, connect, seed_questions
-from quizbot.engine import CODE_ALPHABET, Engine, RuleError, mention, points_for, legacy_points_for, new_game_code
+from quizbot.engine import CODE_ALPHABET, Engine, RuleError, mention, points_for, new_game_code
 from quizbot.__main__ import Runner
 from quizbot.telegram import TelegramError
 
@@ -161,13 +161,9 @@ class BotTests(unittest.TestCase):
             self.e.answer(gid,self.a['user_id'],1,0)
         self.assertEqual(self.e.one('SELECT COUNT(*) FROM answers')[0],2)
 
-    def test_restart_catches_up_and_finishes_at_ten_minutes(self):
+    def test_delayed_timer_check_finishes_at_the_original_deadline(self):
         gid=self.game(count=10)
-        self.db.commit()
-        self.db.close()
         self.clock.advance(600)
-        self.db=connect(self.path)
-        self.e=Engine(self.db,self.clock)
         self.e.tick()
         self.e.tick()
         self.assertEqual(self.e.one('SELECT status FROM games WHERE game_id=?',(gid,))[0],'completed')
@@ -213,19 +209,16 @@ class BotTests(unittest.TestCase):
         self.assertNotIn('Новое имя',result)
 
 
-    def test_review_access_and_hidden_correct_answer(self):
+    def test_history_only_shows_games_the_player_joined(self):
         gid=self.game()
         app=Application(self.e,'test_bot')
-        with self.assertRaises(RuleError):
-            app.review(self.a,gid,1)
         self.clock.advance(300)
         self.e.tick()
-        third=self.e.register(303,'Третий')
-        with self.assertRaises(RuleError):
-            app.review(third,gid,1)
-        app.review(self.a,gid,1)
-        message=json.loads(self.e.one('SELECT payload_json FROM outbox ORDER BY outbox_id DESC')[0])
-        self.assertIn('Верный ответ</b> —',message['text'])
+        self.e.register(303,'Третий')
+        code=self.e.one('SELECT game_code FROM games WHERE game_id=?',(gid,))[0]
+        for player,expected in (('101',f'<code>{code}</code>'),('303','Игр пока нет.')):
+            app.route(player,'/history','',self.clock())
+            self.assertIn(expected,json.loads(app.pending_response(player)['payload_json'])['text'])
 
     def test_new_player_invite_survives_registration(self):
         gid=self.e.create(self.a['user_id'],'Все темы','mixed',5,60)
@@ -289,7 +282,7 @@ class BotTests(unittest.TestCase):
     def test_html_nickname_is_escaped(self):
         self.assertIn('&lt;',mention(101,'<x>'))
 
-    def test_full_menu_flow_to_profile_history_and_review(self):
+    def test_full_menu_flow_to_leaderboard_and_compact_history(self):
         client=FakeClient()
         runner=self.runner(client)
         runner.engine=self.e
@@ -322,21 +315,29 @@ class BotTests(unittest.TestCase):
         # An old start button must not duplicate the question snapshots.
         event(101,data='start:%s'%game['game_id'])
         self.assertEqual(self.e.one('SELECT COUNT(*) FROM game_questions')[0],5)
+        answer_ids=set()
         for q in self.e.all('SELECT * FROM game_questions ORDER BY position'):
             for pid in (101,202):
                 self.delivered(game['game_id'],self.e.user(pid))
                 self.clock.advance(1)
                 selected=q['correct_answer_snapshot'] if pid==101 else (q['correct_answer_snapshot']+1)%4
                 event(pid,data='a:%s:%s:%s'%(game['game_id'],q['position'],selected))
+                answer_ids.add(str(update_id))
+        self.collect(runner)
+        replies={params['callback_query_id']:params['text'] for method,params in client.calls
+                 if method=='answerCallbackQuery' and params['callback_query_id'] in answer_ids}
+        self.assertEqual(replies,dict.fromkeys(answer_ids,''))
         self.assertEqual(self.e.one('SELECT status FROM games')[0],'completed')
         self.assertEqual(self.e.one("SELECT COUNT(*) FROM outbox WHERE kind='question'")[0],0)
-        event(101,data='profile')
+        result=payloads[-1]
+        self.assertIn('Таблица лидеров',result['text'])
+        self.assertEqual(result['reply_markup']['inline_keyboard'], [[
+            {'text':'История игр','callback_data':'history:0'}, {'text':'Меню','callback_data':'menu'}]])
         event(101,data='history:0')
-        event(101,text='/game '+game['game_code'])
-        event(101,data='review:%s:1'%game['game_id'])
-        self.assertTrue(any('Ваш ник —' in p['text'] for p in payloads))
-        self.assertTrue(any('История игр' in p['text'] for p in payloads))
-        self.assertTrue(any('Верный ответ</b> —' in p['text'] for p in payloads))
+        history=payloads[-1]['text']
+        self.assertIn('История игр',history)
+        self.assertIn(game['game_code'],history)
+        self.assertIn('Завершена · 1-е место,',history)
         self.assertTrue(all(len(p['text'])<=4096 for p in payloads))
         self.assertTrue(all(len(b['callback_data'].encode())<=64 for p in payloads
             for row in p.get('reply_markup',{}).get('inline_keyboard',[]) for b in row))
@@ -452,14 +453,42 @@ class BotTests(unittest.TestCase):
         with self.assertRaises(RuleError):
             self.e.answer(gid,self.a['user_id'],2,0)
 
-    def test_legacy_game_keeps_original_scoring(self):
-        gid=self.game()
-        self.db.execute('UPDATE games SET scoring_version=1 WHERE game_id=?',(gid,))
-        q=self.e.one('SELECT * FROM game_questions WHERE game_id=? AND position=1',(gid,))
-        self.clock.advance(30)
-        self.e.answer(gid,self.a['user_id'],1,q['correct_answer_snapshot'])
-        a=self.e.one('SELECT * FROM answers WHERE user_id=?',(self.a['user_id'],))
-        self.assertEqual(a['points_awarded'],legacy_points_for(q['base_points'],30000,60000,True))
+    def test_bot_start_cancels_open_games_without_resuming_or_replaying_them(self):
+        completed=self.game()
+        self.answer_all(completed,self.a)
+        self.answer_all(completed,self.b,False)
+        saved_result=self.e.results(completed)
+        started=self.game()
+        q=self.e.one('SELECT * FROM game_questions WHERE game_id=? AND position=1',(started,))
+        self.e.answer(started,self.a['user_id'],1,q['correct_answer_snapshot'])
+        owner=self.e.register(303,'Вера')['user_id']
+        lobby=self.e.create(owner,'Все темы','mixed',5,60)
+        self.e.set_state(303,{'step':'join'})
+        self.db.execute("INSERT INTO settings VALUES('update_offset:default','25')")
+        self.db.commit()
+        self.db.close()
+        self.clock.advance(600)
+        self.db=connect(self.path)
+        self.e=Engine(self.db,self.clock)
+        runner=self.runner(FakeClient())
+        runner.engine=self.e
+        with patch.object(runner,'_poll'), patch.object(runner,'deliver',side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                runner.run()
+
+        self.assertEqual(self.e.one('SELECT status FROM games WHERE game_id=?',(completed,))[0],'completed')
+        self.assertEqual(self.e.results(completed),saved_result)
+        for game_id in (started,lobby):
+            self.assertEqual(tuple(self.e.one('SELECT status,finished_at FROM games WHERE game_id=?',(game_id,))),
+                             ('cancelled',self.clock()))
+        self.assertEqual(self.e.one('SELECT COUNT(*) FROM answers WHERE game_id=?',(started,))[0],1)
+        self.assertEqual(self.e.one('SELECT COUNT(*) FROM game_questions WHERE game_id=?',(started,))[0],5)
+        self.assertIsNone(self.e.one('SELECT 1 FROM game_participants WHERE game_id=? AND question_deadline_at IS NOT NULL',
+                                    (started,)))
+        self.assertIsNone(self.e.one('SELECT 1 FROM outbox'))
+        self.assertEqual(self.e.state(303),{})
+        self.assertEqual(self.e.one("SELECT value FROM settings WHERE key='update_offset:default'")[0],'25')
+        self.assertGreater(self.e.create(self.a['user_id'],'Все темы','mixed',5,60),lobby)
 
     def test_wizard_and_questions_edit_one_persistent_message(self):
         client=FakeClient()
@@ -556,7 +585,7 @@ class BotTests(unittest.TestCase):
         old=self.e.one("SELECT message_id FROM ui_messages WHERE chat_id='101' AND slot='room'")[0]
         click('menu',old)
         self.assertEqual(self.e.state(101),{})
-        # A newer /start or profile menu is now at the bottom of the chat.
+        # A newer main menu is now at the bottom of the chat.
         click('create',900)
         self.assertEqual(self.e.state(101)['step'],'wizard')
         edit=[params for method,params in client.calls if method=='editMessageText'][-1]

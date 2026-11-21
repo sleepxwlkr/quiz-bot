@@ -398,7 +398,7 @@ class QuestionAdmin:
                 f'{index+1}. {html.escape(shorten(option, 150))}' for index, option in enumerate(draft['options']))
             rows.append([(str(index+1), f'choose:{index}') for index in range(len(draft['options']))])
         else:
-            hint = 'Отправьте пояснение, которое появится в разборе. Его можно оставить пустым.'
+            hint = 'Отправьте пояснение к правильному ответу. Его можно оставить пустым.'
             rows.append([('Пропустить' if not draft.get('explanation') else 'Убрать пояснение', 'choose:empty')])
         if 'explanation' in draft and 'correct' in draft:
             rows.append([('К предпросмотру', 'choose:preview')])

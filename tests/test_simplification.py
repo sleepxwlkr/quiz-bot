@@ -8,7 +8,6 @@ from unittest.mock import patch
 
 from quizbot.app import Application, menu
 from quizbot.db import ROOT, connect
-from quizbot.engine import Engine
 from tests import test_bot as fixtures
 
 Clock=fixtures.Clock
@@ -92,13 +91,6 @@ class UpgradeTests(unittest.TestCase):
                                      {'rating_before','rating_change','rating_after'})
                     self.assertFalse(db.execute("SELECT 1 FROM sqlite_master WHERE type='view'").fetchall())
                     self.assertFalse(db.execute('SELECT 1 FROM outbox').fetchall())
-                    engine=Engine(db,Clock())
-                    app=Application(engine,'test_bot')
-                    with db:
-                        app.restore_after_upgrade()
-                    self.assertFalse(engine.one("SELECT 1 FROM settings WHERE key='refresh_screens_after_upgrade'"))
-                    for row in engine.all('SELECT payload_json FROM outbox'):
-                        self.assertNotIn('Elo',json.loads(row[0])['text'])
                     backups=list(path.parent.glob(path.stem+'.before-v4-*.db'))
                     self.assertEqual(len(backups),1)
                     saved=sqlite3.connect(backups[0])
@@ -128,38 +120,6 @@ class UpgradeTests(unittest.TestCase):
         self.assertEqual(len(list(path.parent.glob(path.stem+'.before-v4-*.db'))),1)
 
 
-    def test_upgrade_restores_current_room_question_without_resetting_time(self):
-        path=self.legacy(2)
-        now=Clock()()
-        original=sqlite3.connect(path)
-        original.execute("""UPDATE games SET status='in_progress',started_at=?,hard_deadline_at=?
-            WHERE game_id=2""",(now-3,now+297))
-        original.execute("""UPDATE game_participants SET participant_status='playing',current_position=1,
-            question_opened_at=?,question_delivered_at=?,question_deadline_at=? WHERE game_id=2""",
-            (now-3,now-2,now+57))
-        original.execute("""INSERT INTO game_questions VALUES(2,1,1,'Тема','easy','Сколько будет 2+2?',
-            '["4","5"]',0,'',10)""")
-        original.commit()
-        original.close()
-        db=connect(path)
-        try:
-            engine=Engine(db,Clock())
-            app=Application(engine,'test_bot')
-            with db:
-                app.restore_after_upgrade()
-                engine.tick()
-            pending=engine.all("SELECT * FROM outbox WHERE kind='question' AND game_id=2")
-            self.assertEqual(len(pending),2)
-            self.assertIn('Вопрос 1 из 5',engine.question_payload(pending[0])['text'])
-            for row in pending:
-                engine.confirm_delivery(row,900+row['user_id'],now)
-            player=engine.one('SELECT * FROM game_participants WHERE game_id=2 AND user_id=1')
-            self.assertEqual(player['question_delivered_at'],now-2)
-            self.assertEqual(player['question_deadline_at'],now+57)
-        finally:
-            db.close()
-
-
 # Reuse fixtures without importing the old test class into unittest discovery.
 class SimpleGameTests(unittest.TestCase):
     setUp=fixtures.BotTests.setUp
@@ -186,29 +146,17 @@ class SimpleGameTests(unittest.TestCase):
         self.assertEqual(self.e.one('SELECT total_score FROM game_participants WHERE game_id=? AND user_id=?',
                                    (second,self.a['user_id']))[0],0)
 
-    def test_profile_only_contains_nickname_and_history_navigation(self):
-        app=Application(self.e,'test_bot')
-        app.profile(self.a)
-        payload=json.loads(self.e.one("SELECT payload_json FROM outbox WHERE chat_id='101'")[0])
-        self.assertIn('Ваш ник —',payload['text'])
-        self.assertNotIn('Средн',payload['text'])
-        self.assertNotIn('Elo',payload['text'])
-        self.assertNotIn('За всё время',payload['text'])
-        buttons=[b['callback_data'] for row in payload['reply_markup']['inline_keyboard'] for b in row]
-        self.assertIn('nick',buttons)
-        self.assertIn('history:0',buttons)
-        self.assertFalse(hasattr(self.e,'find_duel'))
-        self.assertFalse(hasattr(self.e,'challenge'))
-
     def test_removed_commands_and_old_buttons_return_to_simple_menu(self):
         app=Application(self.e,'test_bot')
         allowed={b['callback_data'] for row in menu()['inline_keyboard'] for b in row}
-        self.assertFalse(allowed & {'duel','duel_search','duel_friend'})
-        for command in ('/duel','/challenge'):
-            app.route('101',command,'',self.clock())
-        for data in ('duel','duel_search','duel_friend'):
-            app.route('101','',data,self.clock())
+        self.assertFalse(allowed & {'duel','duel_search','duel_friend','profile'})
+        self.assertIn('history:0',allowed)
+        events=[(command,'') for command in ('/duel','/challenge','/profile','/game OLD1')]
+        events.extend(('',data) for data in ('duel','duel_search','duel_friend','profile','result:1','review:1:1'))
+        for text,data in events:
+            with self.subTest(text=text,data=data):
+                app.route('101',text,data,self.clock())
+                view=json.loads(self.e.one("SELECT payload_json FROM outbox WHERE chat_id='101' AND slot='room'")[0])
+                self.assertIn('Главное меню',view['text'])
+                self.assertEqual(view['reply_markup'],menu())
         self.assertEqual(self.e.one('SELECT COUNT(*) FROM games')[0],0)
-        view=json.loads(self.e.one("SELECT payload_json FROM outbox WHERE chat_id='101' AND slot='room'")[0])
-        self.assertNotIn('Elo',view['text'])
-        self.assertIn('create',[b['callback_data'] for row in view['reply_markup']['inline_keyboard'] for b in row])

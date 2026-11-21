@@ -235,10 +235,19 @@ class Runner:
                 events.put(('error',RuntimeError('Polling worker failed. Restart the bot.')))
                 return
 
-    def run(self):
+    def reset_session(self):
+        """Close unfinished games and discard pending screens from the previous run."""
         with self.db:
-            self.app.restore_after_upgrade()
-            self.engine.tick()
+            self.db.execute("""UPDATE games SET status='cancelled',finished_at=?
+                WHERE status IN ('lobby','in_progress')""", (self.engine.clock(),))
+            self.db.execute("""UPDATE game_participants SET question_deadline_at=NULL
+                WHERE question_deadline_at IS NOT NULL AND game_id IN (
+                    SELECT game_id FROM games WHERE status='cancelled')""")
+            self.db.execute('DELETE FROM conversations')
+            self.db.execute('DELETE FROM outbox')
+
+    def run(self):
+        self.reset_session()
         stop=threading.Event()
         events=queue.Queue()
         row=self.engine.one('SELECT value FROM settings WHERE key=?',(self.offset_key,))
@@ -316,7 +325,7 @@ def main():
             if hook.get('url'):
                 raise RuntimeError('An existing webhook is configured. Remove it before starting long polling; see README.md.')
             commands=[('start','Открыть главное меню'),('create','Создать комнату'),('join','Войти по коду'),
-                      ('room','Вернуться к текущей игре'),('profile','Открыть профиль'),('history','Посмотреть историю игр'),
+                      ('room','Вернуться к текущей игре'),('history','Посмотреть историю игр'),
                       ('nick','Сменить ник'),('top','Посмотреть рейтинг за месяц'),('leave','Выйти из игры'),
                       ('help','Как играть')]
             client.call('setMyCommands',commands=[{'command':c,'description':d} for c,d in commands])
@@ -330,7 +339,7 @@ if __name__=='__main__':
     try:
         sys.exit(main())
     except KeyboardInterrupt:
-        print('\nBot stopped. Progress is saved in the database.')
+        print('\nBot stopped. Unfinished games will be cancelled on the next start.')
     except (RuntimeError,TelegramError,ValueError,OSError) as exc:
         log.error('%s',exc)
         sys.exit(1)

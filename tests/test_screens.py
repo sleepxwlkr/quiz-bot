@@ -102,10 +102,9 @@ class ScreenTests(unittest.TestCase):
         self.request(text='/start')
         message_id=self.current_id()
         screens=[
-            ('profile','Профиль'),('history:0','История игр'),('top','Общий рейтинг'),
-            ('help','Как играть'),('nick','Введите новый ник'),('menu','Выберите действие'),
+            ('history:0','История игр'),('top','Общий рейтинг'),('help','Как играть'),
             ('join','Введите код'),('menu','Выберите действие'),
-            ('menu','Выберите действие'),('create','Настройки комнаты'),
+            ('create','Настройки комнаты'),
         ]
         for data,expected in screens:
             with self.subTest(screen=data):
@@ -158,17 +157,19 @@ class ScreenTests(unittest.TestCase):
         self.assertIn('\n1. Борис — 3 балла\n2. Алиса — 2 балла\n',january)
         self.assertNotIn('Вера',january)
 
-    def test_history_pagination_results_and_reviews_share_one_screen(self):
+    def test_compact_history_paginates_on_one_screen(self):
         games=[self.complete_game() for _ in range(6)]
+        oldest=self.e.one('SELECT game_code FROM games WHERE game_id=?',(games[0],))[0]
         history=self.request(text='/history')
-        self.assertEqual(history['reply_markup']['inline_keyboard'][-1],
-                         [{'text':'Меню','callback_data':'menu'}])
+        self.assertEqual(history['reply_markup']['inline_keyboard'], [[{'text':'Далее →','callback_data':'history:1'}],
+                                                                    [{'text':'Меню','callback_data':'menu'}]])
+        self.assertNotIn(oldest,history['text'])
         message_id=self.current_id()
-        self.assertIn('страница 2',self.request(data='history:1')['text'])
-        self.assertIn('Итоги игры',self.request(data='result:%s'%games[0])['text'])
-        self.assertIn('Вопрос 1 из 5',self.request(data='review:%s:1'%games[0])['text'])
-        self.assertIn('Вопрос 2 из 5',self.request(data='review:%s:2'%games[0])['text'])
-        self.assertIn('История игр',self.request(data='history:0')['text'])
+        page_two=self.request(data='history:1')['text']
+        self.assertIn('страница 2',page_two)
+        self.assertIn(f'<code>{oldest}</code>',page_two)
+        self.assertIn('Завершена · 1-е место, 0 очков',page_two)
+        self.assertIn('страница 1',self.request(data='history:0')['text'])
         self.assertEqual(self.current_id(),message_id)
 
     def test_registration_and_input_errors_replace_previous_prompts(self):
@@ -176,22 +177,21 @@ class ScreenTests(unittest.TestCase):
         self.assertIn('от 3 до 24',self.request(text='x',pid=303)['text'])
         self.assertIn('Вы готовы к игре',self.request(text='Новый игрок',pid=303)['text'])
         self.assertEqual(self.e.user(303)['nickname'],'Новый игрок')
-        self.assertIn('Профиль',self.request(data='profile',pid=303)['text'])
+        self.assertIn('Игр пока нет',self.request(data='history:0',pid=303)['text'])
         self.assertEqual(self.e.one("SELECT COUNT(*) FROM ui_messages WHERE chat_id='303'")[0],1)
 
     def test_rename_prompt_clears_buttons_and_accepts_text_in_one_screen(self):
         self.request(text='/start')
-        view=self.request(data='nick')
+        view=self.request(text='/nick')
         self.assertEqual(view['reply_markup']['inline_keyboard'],[])
-        self.assertIn('Теперь ваш ник',self.request(text='Алиса 2')['text'])
+        self.assertIn('Теперь ваш ник — <b>Алиса 2</b>',self.request(text='Алиса 2')['text'])
         self.assertEqual(self.e.user(101)['nickname'],'Алиса 2')
-        self.assertIn('Алиса 2',self.request(data='profile')['text'])
         self.assertEqual(len(self.client.messages),1)
 
     def test_text_commands_replace_and_remove_previous_bot_screen(self):
         self.request(text='/start')
         old=self.current_id()
-        for command,title in [('/profile','Профиль'),('/history','История игр'),('/help','Как играть'),('/menu','Выберите действие')]:
+        for command,title in [('/history','История игр'),('/help','Как играть'),('/menu','Выберите действие')]:
             view=self.request(text=command)
             self.assertIn(title,view['text'])
             if command=='/help':
@@ -216,7 +216,7 @@ class ScreenTests(unittest.TestCase):
         self.assertEqual(self.e.state(101),{})
         self.assertEqual(len(self.client.messages),1)
 
-    def test_profile_and_back_to_game_keep_question_time(self):
+    def test_history_and_back_to_game_keep_question_time(self):
         gid=self.e.create(self.a['user_id'],'Все темы','mixed',5,60)
         code=self.e.one('SELECT game_code FROM games WHERE game_id=?',(gid,))[0]
         self.e.join(self.b['user_id'],code)
@@ -224,7 +224,7 @@ class ScreenTests(unittest.TestCase):
         self.flush()
         before=self.e.one('SELECT * FROM game_participants WHERE game_id=? AND user_id=?',(gid,self.a['user_id']))
         self.clock.advance(20)
-        self.request(data='profile')
+        self.assertIn('Идёт',self.request(data='history:0')['text'])
         message_id=self.current_id()
         self.assertIn('Вопрос 1 из 5',self.request(data='room')['text'])
         after=self.e.one('SELECT * FROM game_participants WHERE game_id=? AND user_id=?',(gid,self.a['user_id']))
@@ -237,21 +237,21 @@ class ScreenTests(unittest.TestCase):
         self.request(text='/start')
         original=self.current_id()
         old_menu=self.client.call('sendMessage',chat_id='101',text='An older menu')['message_id']
-        self.assertIn('Профиль',self.request(data='profile',message_id=old_menu)['text'])
+        self.assertIn('История игр',self.request(data='history:0',message_id=old_menu)['text'])
         self.assertEqual(self.current_id(),old_menu)
         self.assertNotIn(('101',original),self.client.messages)
 
-    def test_deleted_screen_is_recreated_for_profile_navigation(self):
+    def test_deleted_screen_is_recreated_for_history_navigation(self):
         self.request(text='/start')
         deleted=self.current_id()
         self.client.messages.pop(('101',deleted))
-        self.assertIn('Профиль',self.request(data='profile',message_id=deleted)['text'])
+        self.assertIn('История игр',self.request(data='history:0',message_id=deleted)['text'])
         self.assertNotEqual(self.current_id(),deleted)
 
     def test_fast_navigation_queues_only_latest_screen(self):
         self.request(text='/start')
         message_id=self.current_id()
-        for data in ('profile','history:0','help','menu'):
+        for data in ('top','history:0','help','menu'):
             self.runner.app.route('101','',data,self.clock(),message_id)
         self.assertEqual(self.e.one("SELECT COUNT(*) FROM outbox WHERE chat_id='101' AND slot='room'")[0],1)
         self.flush()

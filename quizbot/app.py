@@ -11,8 +11,7 @@ LOCAL_TZ = timezone(timedelta(hours=5))
 
 def menu():
     return keyboard([('Создать комнату','create'),('Войти по коду','join')],
-                    [('Моя игра','room')],
-                    [('Профиль','profile'),('История игр','history:0')],
+                    [('Моя игра','room'),('История игр','history:0')],
                     [('Общий рейтинг','top'),('Правила','help')])
 
 
@@ -21,21 +20,6 @@ class Application:
         self.e = engine
         self.bot_username = bot_username
         self.admin = QuestionAdmin(engine, admin_ids, menu)
-
-    def restore_after_upgrade(self):
-        if not self.e.one("SELECT 1 FROM settings WHERE key='refresh_screens_after_upgrade'"):
-            return
-        users=self.e.all("""SELECT u.* FROM users u WHERE EXISTS
-            (SELECT 1 FROM ui_messages m WHERE m.chat_id=u.platform_user_id)
-            OR EXISTS (SELECT 1 FROM game_participants p JOIN games g USING(game_id)
-                       WHERE p.user_id=u.user_id AND g.status IN ('lobby','in_progress'))""")
-        for user in users:
-            game=self.e.active(user['user_id'])
-            if game:
-                self.lobby(user,game['game_id'])
-            else:
-                self.e.send(user['platform_user_id'],'<b>Главное меню</b>\nВыберите действие.',menu())
-        self.e.db.execute("DELETE FROM settings WHERE key='refresh_screens_after_upgrade'")
 
     def handle(self, update, received_at=None):
         callback = update.get('callback_query')
@@ -108,8 +92,8 @@ class Application:
         if cmd=='/admin' or data.startswith('adm:'):
             return self.admin.handle(pid,cmd,data,text,state)
         if state.get('step')=='admin':
-            player_commands = ('/start','/menu','/help','/profile','/nick','/create',
-                               '/join','/room','/leave','/history','/top','/game')
+            player_commands = ('/start','/menu','/help','/nick','/create',
+                               '/join','/room','/leave','/history','/top')
             if not data and cmd not in player_commands:
                 return self.admin.handle(pid,cmd,data,text,state)
             self.e.set_state(pid,{})
@@ -153,15 +137,13 @@ class Application:
                 '<b>Места в игре</b>\n'
                 'Выше тот, кто набрал больше очков. При равенстве важнее число верных ответов, '
                 'а затем меньшее суммарное время. Пропуск добавляет полный лимит времени. Если всё совпало, место общее. '
-                'Игроки, которые вышли досрочно, идут после тех, кто доиграл. Итоги можно открыть в истории.\n\n'
+                'Игроки, которые вышли досрочно, идут после тех, кто доиграл. Свои места и очки можно посмотреть в истории.\n\n'
                 '<b>Общий рейтинг за месяц</b>\n'
                 'За первые три места дают 3, 2 и 1 балл. Чтобы получить баллы, завершите игру '
                 'и дайте хотя бы один верный ответ.\n\n'
                 'Команда /room вернёт к текущей игре, а /leave откроет подтверждение выхода.',
                 keyboard([('Меню','menu')]))
-        elif cmd=='/profile' or data=='profile':
-            self.profile(u)
-        elif cmd=='/nick' or data=='nick':
+        elif cmd=='/nick':
             self.e.set_state(pid,{'step':'nick'})
             self.e.send(pid,'<b>Смена ника</b>\nВведите новый ник от 3 до 24 символов. '
                         'В итогах прошлых игр останется прежний ник.\n\nДля отмены отправьте /cancel.')
@@ -230,19 +212,11 @@ class Application:
                     self.lobby(self.e.user(participant['platform_user_id']),g['game_id'])
         elif data.startswith('a:'):
             _,gid,pos,selected = data.split(':')
-            return self.e.answer(int(gid),uid,int(pos),int(selected),received_at)
+            self.e.answer(int(gid),uid,int(pos),int(selected),received_at)
         elif cmd=='/history' or data.startswith('history:'):
             self.history(u,int(data.split(':')[1]) if data else 0)
         elif cmd=='/top' or data=='top':
             self.show_leaderboard(pid)
-        elif cmd=='/game':
-            g = self.e.one('SELECT * FROM games WHERE game_code=?',(arg.upper(),))
-            self.result_for(u,g)
-        elif data.startswith('result:'):
-            self.result_for(u,self.e.one('SELECT * FROM games WHERE game_id=?',(int(data.split(':')[1]),)))
-        elif data.startswith('review:'):
-            _,gid,pos = data.split(':')
-            self.review(u,int(gid),int(pos))
         elif text and not cmd and state.get('step')=='nick':
             changed = self.e.register(pid,text)
             self.e.set_state(pid,{})
@@ -330,8 +304,6 @@ class Application:
         players = self.e.participants(gid)
         if not any(p['user_id']==u['user_id'] for p in players):
             raise RuleError('Вы не участник этой игры.')
-        if g['status']=='completed':
-            return self.result_for(u,g)
         p = next(p for p in players if p['user_id']==u['user_id'])
         if g['status']=='in_progress' and p['participant_status']=='playing':
             self.e.send(u['platform_user_id'],'',kind='question',game_id=gid,user_id=u['user_id'],position=p['current_position'])
@@ -364,11 +336,6 @@ class Application:
                           'https://t.me/%s?start=join_%s'%(self.bot_username,g['game_code'])])
         self.e.send(u['platform_user_id'],'\n'.join(lines),keyboard(*rows),slot='room')
 
-    def profile(self,u):
-        lines = ['<b>Профиль</b>','Ваш ник — '+mention(u['platform_user_id'],u['nickname']),
-                 '\nНажмите «История игр», чтобы посмотреть свои места и ответы.']
-        self.e.send(u['platform_user_id'],'\n'.join(lines),keyboard([('Сменить ник','nick'),('История игр','history:0')],[('Меню','menu')]))
-
     def show_leaderboard(self,pid):
         now = datetime.fromtimestamp(self.e.clock(), LOCAL_TZ)
         month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -389,67 +356,25 @@ class Application:
 
     def history(self,u,page):
         page=max(0,page)
-        records = self.e.all('''SELECT g.*,p.total_score,p.rank FROM games g JOIN game_participants p USING(game_id)
+        records = self.e.all('''SELECT g.game_code,g.created_at,g.status,p.total_score,p.rank
+            FROM games g JOIN game_participants p USING(game_id)
             WHERE p.user_id=? ORDER BY g.game_id DESC LIMIT 6 OFFSET ?''',(u['user_id'],page*5))
-        lines = ['<b>История игр · страница %s</b>'%(page+1),'Время указано по UTC+5.']
-        rows=[]
+        lines = [f'<b>История игр · страница {page+1}</b>', '']
         for g in records[:5]:
-            date = datetime.fromtimestamp(g['created_at'],LOCAL_TZ).strftime('%d.%m.%Y %H:%M')
-            label = {'lobby':'Ждёт старта','in_progress':'Идёт','completed':'Завершена','cancelled':'Отменена'}[g['status']]
-            lines.append('\n<code>%s</code> · %s\n%s · %s'%
-                         (g['game_code'],date,html.escape(g['topic']),label))
+            date = datetime.fromtimestamp(g['created_at'],LOCAL_TZ).strftime('%d.%m.%Y')
+            code = html.escape(g['game_code'])
+            status = {'lobby':'Ждёт старта','in_progress':'Идёт','completed':'Завершена','cancelled':'Отменена'}[g['status']]
             if g['status']=='completed':
-                score = format_count(g['total_score'],'очко','очка','очков')
                 place = f"{g['rank']}-е место, " if g['rank'] is not None else ''
-                lines.append(f'Ваш результат — {place}{score}')
-                rows.append([('Итоги '+g['game_code'],'result:%s'%g['game_id'])])
-            elif g['status']=='in_progress':
-                score = format_count(g['total_score'],'очко','очка','очков')
-                lines.append('У вас сейчас '+score)
+                status += ' · '+place+format_count(g['total_score'],'очко','очка','очков')
+            lines.append(f'<code>{code}</code> · {date} · {status}')
         if not records:
-            lines.extend(['','Игр пока нет. Создайте комнату или войдите по коду из главного меню.'])
+            lines.append('Игр пока нет.')
         navigation=[]
         if page:
             navigation.append(('← Назад','history:%s'%(page-1)))
         if len(records)>5:
             navigation.append(('Далее →','history:%s'%(page+1)))
-        if navigation:
-            rows.append(navigation)
+        rows=[navigation] if navigation else []
         rows.append([('Меню','menu')])
-        self.e.send(u['platform_user_id'],'\n'.join(lines),keyboard(*rows))
-
-    def result_for(self,u,g):
-        if not g or g['status']!='completed' or not self.e.one(
-                'SELECT 1 FROM game_participants WHERE game_id=? AND user_id=?',(g['game_id'],u['user_id'])):
-            raise RuleError('Такой завершённой игры нет в вашей истории. Проверьте код или выберите игру в /history.')
-        self.e.send(u['platform_user_id'],self.e.results(g['game_id']),
-                    keyboard([('Разобрать ответы','review:%s:1'%g['game_id']),('История','history:0')]))
-
-    def review(self,u,gid,pos):
-        g = self.e.one('''SELECT g.* FROM games g JOIN game_participants p USING(game_id)
-            WHERE g.game_id=? AND p.user_id=? AND g.status='completed' ''',(gid,u['user_id']))
-        if not g or not 1<=pos<=g['question_count']:
-            raise RuleError('Вы можете разобрать ответы своей игры, когда закончат все участники.')
-        q = self.e.one('SELECT * FROM game_questions WHERE game_id=? AND position=?',(gid,pos))
-        a = self.e.one('SELECT * FROM answers WHERE game_id=? AND user_id=? AND question_position=?',(gid,u['user_id'],pos))
-        options = json.loads(q['options_snapshot'])
-        chosen = options[a['submitted_answer']] if a['submitted_answer'] is not None else (
-            'пропуск, время вышло' if a['answer_status']=='timed_out' else 'пропуск после выхода из игры')
-        score = format_count(a['points_awarded'],'очко','очка','очков')
-        lines = [f"<b>Разбор ответов</b> · <code>{g['game_code']}</code>",
-                 f'Вопрос {pos} из {g["question_count"]}','',html.escape(q['question_snapshot']),'',
-                 '<b>Ваш ответ</b> — '+html.escape(chosen),
-                 '<b>Верный ответ</b> — '+html.escape(options[q['correct_answer_snapshot']]),
-                 'За вопрос — '+score]
-        if q['explanation_snapshot']:
-            lines.extend(['','<b>Пояснение</b>',html.escape(q['explanation_snapshot'])])
-        rows=[]
-        nav=[]
-        if pos>1:
-            nav.append(('← Назад','review:%s:%s'%(gid,pos-1)))
-        if pos<g['question_count']:
-            nav.append(('Далее →','review:%s:%s'%(gid,pos+1)))
-        if nav:
-            rows.append(nav)
-        rows.append([('Итоги','result:%s'%gid)])
         self.e.send(u['platform_user_id'],'\n'.join(lines),keyboard(*rows))

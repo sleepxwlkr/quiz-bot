@@ -52,7 +52,7 @@ def upgrade_to_v4(db,path,schema):
         execute_schema(db,schema)
         for table in tables:
             if table=='outbox':
-                continue  # Old screens can contain removed menus. Rebuild them at startup.
+                continue  # Old messages can contain screens from removed modes.
             source='_legacy_'+table
             old_columns={r[1] for r in db.execute('PRAGMA table_info('+quoted(source)+')')}
             columns=[r[1] for r in db.execute('PRAGMA table_info('+quoted(table)+')') if r[1] in old_columns]
@@ -67,7 +67,6 @@ def upgrade_to_v4(db,path,schema):
         db.execute("""INSERT OR REPLACE INTO settings VALUES('outbox_sequence',
             MAX(?,COALESCE((SELECT CAST(value AS INTEGER) FROM settings WHERE key='outbox_sequence'),0)))""",
                    (previous_queue_max,))
-        db.execute("INSERT OR REPLACE INTO settings VALUES('refresh_screens_after_upgrade','1')")
         if db.execute('PRAGMA foreign_key_check').fetchone():
             raise RuntimeError('Database migration failed the foreign key check')
         db.commit()
