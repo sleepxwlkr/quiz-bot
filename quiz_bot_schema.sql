@@ -1,4 +1,4 @@
--- SQLite, schema version 4. Times are UTC Unix seconds.
+-- SQLite, schema version 6. Times are UTC Unix seconds.
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
@@ -17,8 +17,30 @@ CREATE TABLE IF NOT EXISTS questions (
     options_json TEXT NOT NULL,
     correct_answer INTEGER NOT NULL,
     explanation TEXT NOT NULL DEFAULT '',
-    is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1))
+    is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
+    revision INTEGER NOT NULL DEFAULT 0 CHECK(revision>=0)
 );
+CREATE TABLE IF NOT EXISTS question_admin_log (
+    log_id INTEGER PRIMARY KEY,
+    actor_telegram_id TEXT NOT NULL,
+    question_id INTEGER NOT NULL REFERENCES questions(question_id) ON DELETE RESTRICT,
+    action TEXT NOT NULL CHECK(action IN ('add','edit','enable','disable')),
+    occurred_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS question_topics (
+    topic_id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    revision INTEGER NOT NULL DEFAULT 0 CHECK(revision>=0)
+);
+INSERT OR IGNORE INTO question_topics(name) SELECT DISTINCT topic FROM questions;
+CREATE TRIGGER IF NOT EXISTS question_topic_after_insert
+AFTER INSERT ON questions BEGIN
+    INSERT INTO question_topics(name) VALUES(NEW.topic) ON CONFLICT(name) DO NOTHING;
+END;
+CREATE TRIGGER IF NOT EXISTS question_topic_after_update
+AFTER UPDATE OF topic ON questions WHEN NEW.topic<>OLD.topic BEGIN
+    INSERT INTO question_topics(name) VALUES(NEW.topic) ON CONFLICT(name) DO NOTHING;
+END;
 CREATE TABLE IF NOT EXISTS games (
     game_id INTEGER PRIMARY KEY,
     game_code TEXT NOT NULL UNIQUE,
@@ -116,4 +138,4 @@ CREATE TABLE IF NOT EXISTS ui_messages (
     message_id INTEGER NOT NULL,
     PRIMARY KEY(chat_id,slot)
 );
-PRAGMA user_version = 4;
+PRAGMA user_version = 6;

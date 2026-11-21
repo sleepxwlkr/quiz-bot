@@ -103,7 +103,7 @@ class ScreenTests(unittest.TestCase):
         message_id=self.current_id()
         screens=[
             ('profile','Профиль'),('history:0','История игр'),('top','Общий рейтинг'),
-            ('help','Квиз-бот'),('nick','Введите новый ник'),('menu','Выберите действие'),
+            ('help','Как играть'),('nick','Введите новый ник'),('menu','Выберите действие'),
             ('join','Введите код'),('menu','Выберите действие'),
             ('menu','Выберите действие'),('create','Настройки комнаты'),
         ]
@@ -149,30 +149,32 @@ class ScreenTests(unittest.TestCase):
         december=self.request(data='top')['text']
         self.assertEqual(self.current_id(),message_id)
         self.assertIn('12.2026',december)
-        self.assertIn('\n1. Алиса — 5\n1. Борис — 5\n3. Вера — 1\n',december)
+        self.assertIn('\n1. Алиса — 5 баллов\n1. Борис — 5 баллов\n3. Вера — 1 балл\n',december)
         self.assertNotIn('Данил',december)
 
         self.clock.now=datetime(2027,1,1,tzinfo=LOCAL_TZ).timestamp()
         january=self.request(text='/top')['text']
         self.assertIn('01.2027',january)
-        self.assertIn('\n1. Борис — 3\n2. Алиса — 2\n',january)
+        self.assertIn('\n1. Борис — 3 балла\n2. Алиса — 2 балла\n',january)
         self.assertNotIn('Вера',january)
 
     def test_history_pagination_results_and_reviews_share_one_screen(self):
         games=[self.complete_game() for _ in range(6)]
-        self.request(text='/history')
+        history=self.request(text='/history')
+        self.assertEqual(history['reply_markup']['inline_keyboard'][-1],
+                         [{'text':'Меню','callback_data':'menu'}])
         message_id=self.current_id()
         self.assertIn('страница 2',self.request(data='history:1')['text'])
-        self.assertIn('Итоги:',self.request(data='result:%s'%games[0])['text'])
-        self.assertIn('вопрос 1/5',self.request(data='review:%s:1'%games[0])['text'])
-        self.assertIn('вопрос 2/5',self.request(data='review:%s:2'%games[0])['text'])
+        self.assertIn('Итоги игры',self.request(data='result:%s'%games[0])['text'])
+        self.assertIn('Вопрос 1 из 5',self.request(data='review:%s:1'%games[0])['text'])
+        self.assertIn('Вопрос 2 из 5',self.request(data='review:%s:2'%games[0])['text'])
         self.assertIn('История игр',self.request(data='history:0')['text'])
         self.assertEqual(self.current_id(),message_id)
 
     def test_registration_and_input_errors_replace_previous_prompts(self):
         self.assertIn('Введите ник',self.request(text='/start',pid=303)['text'])
         self.assertIn('от 3 до 24',self.request(text='x',pid=303)['text'])
-        self.assertIn('Регистрация завершена',self.request(text='Новый игрок',pid=303)['text'])
+        self.assertIn('Вы готовы к игре',self.request(text='Новый игрок',pid=303)['text'])
         self.assertEqual(self.e.user(303)['nickname'],'Новый игрок')
         self.assertIn('Профиль',self.request(data='profile',pid=303)['text'])
         self.assertEqual(self.e.one("SELECT COUNT(*) FROM ui_messages WHERE chat_id='303'")[0],1)
@@ -189,14 +191,25 @@ class ScreenTests(unittest.TestCase):
     def test_text_commands_replace_and_remove_previous_bot_screen(self):
         self.request(text='/start')
         old=self.current_id()
-        for command,title in [('/profile','Профиль'),('/history','История игр'),('/help','Квиз-бот'),('/menu','Выберите действие')]:
-            self.assertIn(title,self.request(text=command)['text'])
+        for command,title in [('/profile','Профиль'),('/history','История игр'),('/help','Как играть'),('/menu','Выберите действие')]:
+            view=self.request(text=command)
+            self.assertIn(title,view['text'])
+            if command=='/help':
+                self.assertEqual(view['reply_markup']['inline_keyboard'],[[{'text':'Меню','callback_data':'menu'}]])
             self.assertNotEqual(old,self.current_id())
             self.assertNotIn(('101',old),self.client.messages)
             old=self.current_id()
 
     def test_join_error_and_cancel_do_not_leave_old_menus(self):
         self.request(text='/start')
+        old=self.current_id()
+        prompt=self.request(data='join')
+        self.assertNotIn('/cancel',prompt['text'])
+        button,=prompt['reply_markup']['inline_keyboard'][0]
+        self.assertEqual(button['text'],'Меню')
+        self.assertIn('Выберите действие',self.request(data=button['callback_data'])['text'])
+        self.assertEqual(self.e.state(101),{})
+        self.assertEqual(self.current_id(),old)
         self.request(data='join')
         self.assertIn('Комната не найдена',self.request(text='NOT-A-ROOM')['text'])
         self.assertIn('Выберите действие',self.request(text='/cancel')['text'])
@@ -213,7 +226,7 @@ class ScreenTests(unittest.TestCase):
         self.clock.advance(20)
         self.request(data='profile')
         message_id=self.current_id()
-        self.assertIn('Вопрос 1/5',self.request(data='room')['text'])
+        self.assertIn('Вопрос 1 из 5',self.request(data='room')['text'])
         after=self.e.one('SELECT * FROM game_participants WHERE game_id=? AND user_id=?',(gid,self.a['user_id']))
         self.assertEqual(self.current_id(),message_id)
         self.assertEqual(before['question_deadline_at'],after['question_deadline_at'])

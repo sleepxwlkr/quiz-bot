@@ -74,7 +74,7 @@ class UpgradeTests(unittest.TestCase):
                 path=self.legacy(version)
                 db=connect(path)
                 try:
-                    self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],4)
+                    self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],6)
                     self.assertEqual(db.execute('SELECT COUNT(*) FROM users').fetchone()[0],5)
                     self.assertEqual(db.execute('SELECT COUNT(*) FROM games').fetchone()[0],5)
                     self.assertEqual(db.execute('SELECT game_code FROM games WHERE game_id=1').fetchone()[0],'OLD1')
@@ -150,7 +150,7 @@ class UpgradeTests(unittest.TestCase):
                 engine.tick()
             pending=engine.all("SELECT * FROM outbox WHERE kind='question' AND game_id=2")
             self.assertEqual(len(pending),2)
-            self.assertIn('Вопрос 1/5',engine.question_payload(pending[0])['text'])
+            self.assertIn('Вопрос 1 из 5',engine.question_payload(pending[0])['text'])
             for row in pending:
                 engine.confirm_delivery(row,900+row['user_id'],now)
             player=engine.one('SELECT * FROM game_participants WHERE game_id=2 AND user_id=1')
@@ -179,7 +179,7 @@ class SimpleGameTests(unittest.TestCase):
         self.assertEqual(self.e.participants(second)[0]['user_id'],self.b['user_id'])
         for gid in (first,second):
             result=self.e.results(gid)
-            self.assertIn('рейтинг игры',result)
+            self.assertIn('Таблица лидеров',result)
             self.assertIn(self.e.one('SELECT game_code FROM games WHERE game_id=?',(gid,))[0],result)
             self.assertNotIn('Elo',result)
             self.assertIn('tg://user?id=',result)
@@ -190,7 +190,7 @@ class SimpleGameTests(unittest.TestCase):
         app=Application(self.e,'test_bot')
         app.profile(self.a)
         payload=json.loads(self.e.one("SELECT payload_json FROM outbox WHERE chat_id='101'")[0])
-        self.assertIn('Ваш ник:',payload['text'])
+        self.assertIn('Ваш ник —',payload['text'])
         self.assertNotIn('Средн',payload['text'])
         self.assertNotIn('Elo',payload['text'])
         self.assertNotIn('За всё время',payload['text'])

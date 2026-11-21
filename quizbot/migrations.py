@@ -1,4 +1,4 @@
-"""Upgrade old installations to room games with per-game leaderboards."""
+"""Database upgrades. Versions 1–3 require a rebuild, version 4 is additive."""
 import logging
 import sqlite3
 import time
@@ -26,6 +26,7 @@ def execute_schema(db,schema):
 
 
 def upgrade_to_v4(db,path,schema):
+    # Rebuild onto the current schema, including additive features since v4.
     path=Path(path)
     backup=path.with_name(path.stem+'.before-v4-'+uuid.uuid4().hex[:8]+'.db')
     saved=sqlite3.connect(str(backup))
@@ -75,3 +76,17 @@ def upgrade_to_v4(db,path,schema):
         raise
     finally:
         db.execute('PRAGMA foreign_keys=ON')
+
+
+def upgrade_question_schema(db, schema, version):
+    try:
+        db.execute('BEGIN IMMEDIATE')
+        if version == 4:
+            db.execute('ALTER TABLE questions ADD COLUMN revision INTEGER NOT NULL DEFAULT 0 CHECK(revision>=0)')
+        execute_schema(db, schema)
+        if db.execute('PRAGMA foreign_key_check').fetchone():
+            raise RuntimeError('Database migration failed the foreign key check')
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise

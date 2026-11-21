@@ -3,7 +3,8 @@ import json
 import secrets
 from datetime import datetime, timedelta, timezone
 
-from .engine import DIFFICULTIES, RuleError, keyboard, mention
+from .admin import QuestionAdmin
+from .engine import DIFFICULTIES, RuleError, format_count, keyboard, mention
 
 LOCAL_TZ = timezone(timedelta(hours=5))
 
@@ -11,14 +12,15 @@ LOCAL_TZ = timezone(timedelta(hours=5))
 def menu():
     return keyboard([('Создать комнату','create'),('Войти по коду','join')],
                     [('Моя игра','room')],
-                    [('Профиль','profile'),('История','history:0')],
+                    [('Профиль','profile'),('История игр','history:0')],
                     [('Общий рейтинг','top'),('Правила','help')])
 
 
 class Application:
-    def __init__(self, engine, bot_username):
+    def __init__(self, engine, bot_username, admin_ids=()):
         self.e = engine
         self.bot_username = bot_username
+        self.admin = QuestionAdmin(engine, admin_ids, menu)
 
     def restore_after_upgrade(self):
         if not self.e.one("SELECT 1 FROM settings WHERE key='refresh_screens_after_upgrade'"):
@@ -32,7 +34,7 @@ class Application:
             if game:
                 self.lobby(user,game['game_id'])
             else:
-                self.e.send(user['platform_user_id'],'Главное меню:',menu())
+                self.e.send(user['platform_user_id'],'<b>Главное меню</b>\nВыберите действие.',menu())
         self.e.db.execute("DELETE FROM settings WHERE key='refresh_screens_after_upgrade'")
 
     def handle(self, update, received_at=None):
@@ -44,7 +46,8 @@ class Application:
         pid = str(sender['id'])
         if msg['chat']['type']!='private':
             if (msg.get('text') or '').startswith(('/start','/help')):
-                self.e.send(msg['chat']['id'],'Игры проходят в личном чате: https://t.me/'+self.bot_username)
+                self.e.send(msg['chat']['id'],'Откройте личный чат с ботом, чтобы создать комнату или войти в игру.\n\n'
+                            'https://t.me/'+self.bot_username)
             return 'Откройте личный чат с ботом.'
         text = (msg.get('text') or '').strip() if not callback else ''
         data = callback.get('data','') if callback else ''
@@ -57,7 +60,7 @@ class Application:
             return ''
         except (ValueError,IndexError,KeyError):
             # Stale or fabricated callback data must not poison the update queue.
-            message='Эта кнопка недействительна. Откройте /menu заново.'
+            message='Эта кнопка устарела. Отправьте /menu, чтобы открыть главное меню.'
             if callback:
                 return message
             self.show_error(pid,message,text)
@@ -102,6 +105,15 @@ class Application:
         parts = text.split(maxsplit=1)
         cmd = parts[0].split('@')[0].lower() if parts and parts[0].startswith('/') else ''
         arg = parts[1].strip() if len(parts)>1 else ''
+        if cmd=='/admin' or data.startswith('adm:'):
+            return self.admin.handle(pid,cmd,data,text,state)
+        if state.get('step')=='admin':
+            player_commands = ('/start','/menu','/help','/profile','/nick','/create',
+                               '/join','/room','/leave','/history','/top','/game')
+            if not data and cmd not in player_commands:
+                return self.admin.handle(pid,cmd,data,text,state)
+            self.e.set_state(pid,{})
+            state = {}
         u = self.e.user(pid)
         if cmd=='/start' and arg.startswith('join_'):
             code = arg[5:].upper()
@@ -115,40 +127,47 @@ class Application:
                 u = self.e.register(pid,text)
                 invite = state.get('invite')
                 self.e.set_state(pid,{})
-                self.e.send(pid,'Регистрация завершена. Ваш ник: <b>%s</b>.' % html.escape(u['nickname']),menu())
+                self.e.send(pid,'<b>Вы готовы к игре</b>\nВаш ник — %s.\n\n'
+                            'Создайте комнату или войдите по коду.' % html.escape(u['nickname']),menu())
                 if invite:
                     self.join(u,invite)
             else:
-                self.e.send(pid,'Добро пожаловать! Введите ник для игры (3–24 символа). Больше ничего не нужно.')
+                prompt = ('После этого вы войдёте в комнату по приглашению.' if state.get('invite')
+                          else 'Этот ник увидят другие игроки.')
+                self.e.send(pid,'<b>Добро пожаловать в квиз!</b>\nВведите ник от 3 до 24 символов.\n\n'+prompt)
             return 'Сначала введите ник.' if data else ''
         uid = u['user_id']
         self.e.db.execute('UPDATE users SET last_seen_at=? WHERE user_id=?',(self.e.clock(),uid))
         if cmd in ('/start','/menu','/cancel') or data=='menu':
             self.e.set_state(pid,{})
-            self.e.send(pid,'Выберите действие. /cancel сбрасывает ввод; для выхода из игры — /leave.',menu())
+            self.e.send(pid,'<b>Главное меню</b>\nВыберите действие.',menu())
         elif cmd=='/help' or data=='help':
-            self.e.send(pid,'<b>Квиз-бот</b>\n\n'
-                'Комната: 2–10 игроков, общая тема и настройки, запуск создателем. '
-                'У всех одинаковый случайный порядок вопросов; каждый отвечает в своём темпе.\n\n'
-                'Максимум за вопрос: лёгкий — 15, средний — 20, сложный — 25. '
-                'Первые 10 секунд после доставки — полный максимум. Затем очки плавно уменьшаются '
-                'до половины максимума к сроку ответа; округление до целого, штраф не больше 50%. '
-                'Неверный ответ и тайм-аут — 0. Время вышло — следующий вопрос автоматически. '
-                'Сначала сравниваются очки, затем верные ответы, затем меньшее суммарное время. '
-                'Тайм-аут добавляет полный лимит времени. При полном равенстве место общее. '
-                'Вышедшие досрочно располагаются ниже завершивших.\n\n'
-                'У каждой завершённой игры своя таблица лидеров по набранным очкам.\n\n'
-                '/create — комната\n/join КОД — присоединиться\n/room — текущая игра\n'
-                '/profile — профиль\n/nick — сменить ник\n/history — история\n/game КОД — итог игры\n'
-                '/top — общий рейтинг за месяц\n/leave — выход с подтверждением\n/cancel — отмена ввода',menu())
+            self.e.send(pid,'<b>Как играть</b>\n'
+                'Создайте комнату на 2–10 игроков или войдите по ссылке или коду. '
+                'Игру запускает создатель. Вопросы у всех одинаковые, каждый отвечает в своём темпе.\n\n'
+                '<b>Очки за ответы</b>\n'
+                'Лёгкий вопрос — до 15 очков, средний — до 20, сложный — до 25. '
+                'За верный ответ в первые 10 секунд начисляется максимум. После этого очки постепенно '
+                'снижаются примерно до половины. Ошибка или пропуск дают 0. '
+                'Когда время выходит, бот показывает следующий вопрос.\n\n'
+                '<b>Места в игре</b>\n'
+                'Выше тот, кто набрал больше очков. При равенстве важнее число верных ответов, '
+                'а затем меньшее суммарное время. Пропуск добавляет полный лимит времени. Если всё совпало, место общее. '
+                'Игроки, которые вышли досрочно, идут после тех, кто доиграл. Итоги можно открыть в истории.\n\n'
+                '<b>Общий рейтинг за месяц</b>\n'
+                'За первые три места дают 3, 2 и 1 балл. Чтобы получить баллы, завершите игру '
+                'и дайте хотя бы один верный ответ.\n\n'
+                'Команда /room вернёт к текущей игре, а /leave откроет подтверждение выхода.',
+                keyboard([('Меню','menu')]))
         elif cmd=='/profile' or data=='profile':
             self.profile(u)
         elif cmd=='/nick' or data=='nick':
             self.e.set_state(pid,{'step':'nick'})
-            self.e.send(pid,'Введите новый ник. /cancel — отмена. В истории сохранится ник на момент игры.')
+            self.e.send(pid,'<b>Смена ника</b>\nВведите новый ник от 3 до 24 символов. '
+                        'В итогах прошлых игр останется прежний ник.\n\nДля отмены отправьте /cancel.')
         elif cmd=='/create' or data=='create':
             if self.e.active(uid):
-                raise RuleError('Вы уже в игре. Откройте /room или выйдите через /leave.')
+                raise RuleError('У вас уже есть игра. Чтобы открыть её, нажмите «Моя игра» или отправьте /room.')
             topics = [r[0] for r in self.e.all('SELECT DISTINCT topic FROM questions WHERE is_active=1 ORDER BY topic')]
             topics.insert(0,'Все темы')
             state = {'step':'wizard','token':secrets.token_hex(3),'topics':topics,
@@ -162,11 +181,14 @@ class Application:
                 self.join(u,arg)
             else:
                 self.e.set_state(pid,{'step':'join'})
-                self.e.send(pid,'Введите код из 5 латинских букв или цифр, например S23J8. /cancel — отмена.')
+                self.e.send(pid,'<b>Вход в комнату</b>\nВведите код, который прислал создатель. '
+                            'Обычно это 5 латинских букв и цифр, например <code>S23J8</code>.',
+                            keyboard([('Меню','menu')]))
         elif cmd=='/room' or data=='room' or data.startswith('lobby:'):
             g = self.e.active(uid)
             if not g:
-                raise RuleError('У вас нет активной игры. Создайте комнату или войдите по коду. Результаты прошлых игр: /history.')
+                raise RuleError('У вас пока нет активной игры. Создайте комнату или войдите по коду. '
+                                'Итоги прошлых игр можно посмотреть в /history.')
             self.e.set_state(pid,{})
             self.lobby(u,g['game_id'])
         elif data.startswith('start:'):
@@ -187,7 +209,7 @@ class Application:
             confirmation=data.split(':')
             g = self.e.active(uid)
             if not g or g['game_id']!=int(confirmation[1]):
-                raise RuleError('Подтверждение относится к другой или завершённой игре.')
+                raise RuleError('Это подтверждение больше не действует. Откройте «Моя игра», чтобы увидеть текущую комнату.')
             if g['status']=='lobby' and g['created_by_user_id']==uid:
                 self.delete_lobby(u,g['game_id'],message_id)
                 return ''
@@ -202,7 +224,7 @@ class Application:
             self.e.leave(uid)
             self.e.set_state(pid,{})
             self.e.send(pid,('Вы покинули комнату.' if g['status']=='lobby' else 'Вы вышли из игры.')+
-                        '\n\nГлавное меню:',menu(),slot='room')
+                        '\n\n<b>Главное меню</b>',menu(),slot='room')
             if g['status']=='lobby':
                 for participant in self.e.participants(g['game_id']):
                     self.lobby(self.e.user(participant['platform_user_id']),g['game_id'])
@@ -224,38 +246,38 @@ class Application:
         elif text and not cmd and state.get('step')=='nick':
             changed = self.e.register(pid,text)
             self.e.set_state(pid,{})
-            self.e.send(pid,'Теперь ваш ник: <b>%s</b>.'%html.escape(changed['nickname']),menu())
+            self.e.send(pid,'Теперь ваш ник — <b>%s</b>.'%html.escape(changed['nickname']),menu())
         elif text and not cmd and state.get('step')=='join':
             self.join(u,text)
         else:
-            self.e.send(pid,'Выберите действие кнопкой. Для ответа используйте варианты последнего вопроса.',menu())
+            self.e.send(pid,'<b>Главное меню</b>\nВыберите действие кнопкой ниже. Во время игры отвечайте кнопками под вопросом.',menu())
         return ''
 
     def confirm_leave(self,u,g,message_id):
         participant=self.e.one('SELECT participant_status FROM game_participants WHERE game_id=? AND user_id=?',
                                (g['game_id'],u['user_id']))
         if not participant or participant[0] not in ('joined','playing'):
-            raise RuleError('Ваш тест уже завершён. Дождитесь итогов общей игры.')
+            raise RuleError('Для вас вопросы уже закончились. Итоги появятся, когда закончат остальные.')
         token=secrets.token_hex(4)
         self.e.set_state(u['platform_user_id'],{'step':'confirm_leave','game_id':g['game_id'],
                                               'phase':g['status'],'token':token})
         if g['status']=='lobby':
             text='Точно хотите покинуть комнату?'
         else:
-            text='Точно хотите выйти из игры?\nОставшиеся вопросы получат 0 очков.'
+            text='Точно хотите выйти из игры?\n\nЗа оставшиеся вопросы вы получите 0 очков.'
         self.e.send(u['platform_user_id'],text,
                     keyboard([('Да, выйти','leave_yes:%s:%s'%(g['game_id'],token)),('Отмена','room')]),slot='room')
 
     def confirm_lobby_deletion(self,u,gid,message_id):
         g=self.e.owned_lobby(gid,u['user_id'])
-        self.e.send(u['platform_user_id'],'Удалить лобби <code>%s</code>?\n'
-                    'Оно закроется для всех участников.'%g['game_code'],
+        self.e.send(u['platform_user_id'],'Удалить комнату <code>%s</code>?\n\n'
+                    'Комната закроется для всех, и игра не начнётся.'%g['game_code'],
                     keyboard([('Да, удалить','delete_yes:%s'%gid),('Отмена','room')]),slot='room')
 
     def delete_lobby(self,u,gid,message_id):
         self.e.delete_lobby(gid,u['user_id'])
         self.e.set_state(u['platform_user_id'],{})
-        self.e.send(u['platform_user_id'],'Лобби удалено.\n\nГлавное меню:',menu(),slot='room')
+        self.e.send(u['platform_user_id'],'Комната удалена.\n\n<b>Главное меню</b>',menu(),slot='room')
 
     def join(self, u, code):
         gid = self.e.join(u['user_id'],code)
@@ -273,15 +295,15 @@ class Application:
         count = len(self.e.available_questions(topic,state['difficulty']))
         rows.append([button(str(n)+' вопр.','count',n) for n in (5,10,20,30) if n<=count])
         rows.append([button(str(s)+' сек.','seconds',s) for s in (15,30,60,120)])
-        rows.append([button('Создать','save','yes'),('Отмена','menu')])
-        self.e.send(pid,'<b>Настройки комнаты</b>\nТема: %s\nСложность: %s\nВопросов: %s\nНа вопрос: %s сек.\n\n'
-                    'Нажимайте параметры ниже, затем «Создать».'%
+        rows.append([button('Создать комнату','save','yes'),('Отмена','menu')])
+        self.e.send(pid,'<b>Настройки комнаты</b>\n\nТема — %s\nСложность — %s\nВопросов — %s\nВремя на вопрос — %s с\n\n'
+                    'Чтобы изменить настройку, выберите значение ниже. Когда всё готово, нажмите «Создать комнату».'%
                     (html.escape(topic),DIFFICULTIES[state['difficulty']],state['count'],state['seconds']),keyboard(*rows),slot='room')
 
     def wizard_action(self,u,data,state):
         _,token,key,value = data.split(':')
         if state.get('step')!='wizard' or token!=state.get('token'):
-            raise RuleError('Эти настройки устарели. Откройте /create заново.')
+            raise RuleError('Эти настройки устарели. Отправьте /create, чтобы начать заново.')
         if key=='save':
             gid = self.e.create(u['user_id'],state['topics'][state['topic']],state['difficulty'],state['count'],state['seconds'])
             self.e.set_state(u['platform_user_id'],{})
@@ -289,16 +311,16 @@ class Application:
             return
         allowed = {'topic':range(len(state['topics'])),'difficulty':DIFFICULTIES,'count':(5,10,20,30),'seconds':(15,30,60,120)}
         if key not in allowed:
-            raise RuleError('Неизвестный параметр.')
+            raise RuleError('Не удалось распознать настройку. Используйте кнопки под текущими настройками.')
         value = value if key=='difficulty' else int(value)
         if value not in allowed[key]:
-            raise RuleError('Недопустимое значение.')
+            raise RuleError('Этот вариант недоступен. Выберите другой из текущего меню.')
         state[key] = value
         available = len(self.e.available_questions(state['topics'][state['topic']],state['difficulty']))
         if state['count']>available:
             choices = [n for n in (5,10,20,30) if n<=available]
             if not choices:
-                raise RuleError('В этой категории меньше 5 вопросов. Выберите другую.')
+                raise RuleError('Для этой темы и сложности меньше 5 вопросов. Выберите другую тему или сложность.')
             state['count']=max(choices)
         self.e.set_state(u['platform_user_id'],state)
         self.wizard(u['platform_user_id'],state)
@@ -314,63 +336,78 @@ class Application:
         if g['status']=='in_progress' and p['participant_status']=='playing':
             self.e.send(u['platform_user_id'],'',kind='question',game_id=gid,user_id=u['user_id'],position=p['current_position'])
             return
-        lines = ['<b>Комната</b> · <code>%s</code>'%g['game_code'],
-                 '%s · %s · %s вопросов · %s сек.'%(html.escape(g['topic']),DIFFICULTIES[g['difficulty']],
-                      g['question_count'],g['question_time_limit_seconds']),'','Участники:']
+        lines = [f"<b>Комната {g['game_code']}</b>", f"Тема — {html.escape(g['topic'])}",
+                 f"Сложность — {DIFFICULTIES[g['difficulty']]}",
+                 f"{g['question_count']} вопросов · {g['question_time_limit_seconds']} с на вопрос",
+                 '', f'<b>Игроки ({len(players)} из 10)</b>']
         for participant in players:
-            status = {'joined':'в лобби','playing':'отвечает','finished':'завершил','forfeited':'вышел'}[participant['participant_status']]
-            lines.append('%s — %s'%(mention(participant['platform_user_id'],participant['nickname']),status))
+            label = mention(participant['platform_user_id'],participant['nickname'])
+            if g['status']=='lobby':
+                status = ' — создатель' if participant['user_id']==g['created_by_user_id'] else ''
+            else:
+                status = ' — '+{'joined':'в комнате','playing':'отвечает','finished':'закончил','forfeited':'вышел'}[participant['participant_status']]
+            lines.append('• '+label+status)
         rows = [[('Обновить','room'),('Выйти','leave')]]
         if g['status']=='in_progress':
-            lines.extend(['','Ваш тест завершён. Ожидаем остальных участников.' if p['participant_status']=='finished'
-                          else 'Вы вышли из игры. Ожидаем завершения остальных участников.',
-                          'Итог придёт автоматически.'])
+            lines.extend(['','Вы закончили отвечать.' if p['participant_status']=='finished' else 'Вы вышли из игры.',
+                          'Итоги появятся здесь, когда закончат остальные.'])
             rows = [[('Обновить','room'),('Меню','menu')]]
         if g['status']=='lobby':
             if g['created_by_user_id']==u['user_id']:
                 rows = [[('Обновить','room'),('Удалить','delete:%s'%gid)]]
-            lines.extend(['','Приглашение: https://t.me/%s?start=join_%s'%(self.bot_username,g['game_code']),
-                          'Можно также отправить боту /join '+g['game_code']])
-            if u['user_id']==g['created_by_user_id']:
+                next_step = ('Поделитесь ссылкой или кодом. Для старта нужны хотя бы два игрока.' if len(players)<2
+                             else 'Когда все соберутся, нажмите «Начать игру».')
                 rows.insert(0,[('Начать игру','start:%s'%gid)])
+            else:
+                next_step = 'Игру запустит создатель комнаты.'
+            lines.extend(['',next_step,'','<b>Как пригласить</b>',f"Код комнаты — <code>{g['game_code']}</code>",
+                          'https://t.me/%s?start=join_%s'%(self.bot_username,g['game_code'])])
         self.e.send(u['platform_user_id'],'\n'.join(lines),keyboard(*rows),slot='room')
 
     def profile(self,u):
-        lines = ['<b>Профиль</b>','Ваш ник: '+mention(u['platform_user_id'],u['nickname']),
-                 '\nРезультаты и таблицы лидеров доступны в истории игр.']
-        self.e.send(u['platform_user_id'],'\n'.join(lines),keyboard([('Сменить ник','nick'),('История','history:0')],[('Меню','menu')]))
+        lines = ['<b>Профиль</b>','Ваш ник — '+mention(u['platform_user_id'],u['nickname']),
+                 '\nНажмите «История игр», чтобы посмотреть свои места и ответы.']
+        self.e.send(u['platform_user_id'],'\n'.join(lines),keyboard([('Сменить ник','nick'),('История игр','history:0')],[('Меню','menu')]))
 
     def show_leaderboard(self,pid):
         now = datetime.fromtimestamp(self.e.clock(), LOCAL_TZ)
         month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         next_month = (month_start + timedelta(days=31)).replace(day=1)
         leaders = self.e.leaderboard(month_start.timestamp(), next_month.timestamp())
-        lines = [f'<b>Общий рейтинг · {month_start:%m.%Y}</b>', '']
+        lines = ['<b>Общий рейтинг за месяц</b>', f'{month_start:%m.%Y} · UTC+5', '']
         for player in leaders:
             nickname = html.escape(player['nickname'])
-            lines.append(f"{player['place']}. {nickname} — {player['points']}")
+            points = format_count(player['points'],'балл','балла','баллов')
+            lines.append(f"{player['place']}. {nickname} — {points}")
         if not leaders:
             lines.append('В этом месяце пока никто не набрал баллы.')
-        lines.extend(['', '1-е место — 3 балла · 2-е — 2 · 3-е — 1.',
-                      'Баллы получают игроки, которые завершили игру и дали хотя бы один верный ответ.',
-                      'Показаны до 20 игроков за текущий месяц (UTC+5).'])
+        lines.extend(['', '<b>Как получить баллы</b>',
+                      '1-е место — 3 балла · 2-е — 2 балла · 3-е — 1 балл.',
+                      'Чтобы получить баллы, завершите игру и дайте хотя бы один верный ответ.',
+                      'В таблице до 20 игроков. При равном числе баллов место общее.'])
         self.e.send(pid,'\n'.join(lines),keyboard([('Меню','menu')]))
 
     def history(self,u,page):
         page=max(0,page)
         records = self.e.all('''SELECT g.*,p.total_score,p.rank FROM games g JOIN game_participants p USING(game_id)
             WHERE p.user_id=? ORDER BY g.game_id DESC LIMIT 6 OFFSET ?''',(u['user_id'],page*5))
-        lines = ['<b>История игр · страница %s</b>'%(page+1)]
+        lines = ['<b>История игр · страница %s</b>'%(page+1),'Время указано по UTC+5.']
         rows=[]
         for g in records[:5]:
             date = datetime.fromtimestamp(g['created_at'],LOCAL_TZ).strftime('%d.%m.%Y %H:%M')
-            label = {'lobby':'лобби','in_progress':'идёт','completed':'завершена','cancelled':'отменена'}[g['status']]
-            lines.append('\n<code>%s</code> · %s (UTC+5)\n%s · %s\nОчки: %s · место: %s'%
-                         (g['game_code'],date,html.escape(g['topic']),label,g['total_score'],g['rank'] or '—'))
+            label = {'lobby':'Ждёт старта','in_progress':'Идёт','completed':'Завершена','cancelled':'Отменена'}[g['status']]
+            lines.append('\n<code>%s</code> · %s\n%s · %s'%
+                         (g['game_code'],date,html.escape(g['topic']),label))
             if g['status']=='completed':
-                rows.append([('Рейтинг игры '+g['game_code'],'result:%s'%g['game_id'])])
+                score = format_count(g['total_score'],'очко','очка','очков')
+                place = f"{g['rank']}-е место, " if g['rank'] is not None else ''
+                lines.append(f'Ваш результат — {place}{score}')
+                rows.append([('Итоги '+g['game_code'],'result:%s'%g['game_id'])])
+            elif g['status']=='in_progress':
+                score = format_count(g['total_score'],'очко','очка','очков')
+                lines.append('У вас сейчас '+score)
         if not records:
-            lines.append('Игр пока нет.')
+            lines.extend(['','Игр пока нет. Создайте комнату или войдите по коду из главного меню.'])
         navigation=[]
         if page:
             navigation.append(('← Назад','history:%s'%(page-1)))
@@ -378,13 +415,13 @@ class Application:
             navigation.append(('Далее →','history:%s'%(page+1)))
         if navigation:
             rows.append(navigation)
-        rows.append([('Профиль','profile'),('Меню','menu')])
+        rows.append([('Меню','menu')])
         self.e.send(u['platform_user_id'],'\n'.join(lines),keyboard(*rows))
 
     def result_for(self,u,g):
         if not g or g['status']!='completed' or not self.e.one(
                 'SELECT 1 FROM game_participants WHERE game_id=? AND user_id=?',(g['game_id'],u['user_id'])):
-            raise RuleError('Завершённая игра не найдена в вашей истории.')
+            raise RuleError('Такой завершённой игры нет в вашей истории. Проверьте код или выберите игру в /history.')
         self.e.send(u['platform_user_id'],self.e.results(g['game_id']),
                     keyboard([('Разобрать ответы','review:%s:1'%g['game_id']),('История','history:0')]))
 
@@ -392,18 +429,20 @@ class Application:
         g = self.e.one('''SELECT g.* FROM games g JOIN game_participants p USING(game_id)
             WHERE g.game_id=? AND p.user_id=? AND g.status='completed' ''',(gid,u['user_id']))
         if not g or not 1<=pos<=g['question_count']:
-            raise RuleError('Разбор доступен участникам только после завершения всей игры.')
+            raise RuleError('Вы можете разобрать ответы своей игры, когда закончат все участники.')
         q = self.e.one('SELECT * FROM game_questions WHERE game_id=? AND position=?',(gid,pos))
         a = self.e.one('SELECT * FROM answers WHERE game_id=? AND user_id=? AND question_position=?',(gid,u['user_id'],pos))
         options = json.loads(q['options_snapshot'])
         chosen = options[a['submitted_answer']] if a['submitted_answer'] is not None else (
-            'Пропуск по таймеру' if a['answer_status']=='timed_out' else 'Выход из игры')
-        lines = ['<code>%s</code> · вопрос %s/%s'%(g['game_code'],pos,g['question_count']),
-                 html.escape(q['question_snapshot']),'','Ваш ответ: '+html.escape(chosen),
-                 'Верный ответ: '+html.escape(options[q['correct_answer_snapshot']]),
-                 'Начислено: %s очк.'%a['points_awarded']]
+            'пропуск, время вышло' if a['answer_status']=='timed_out' else 'пропуск после выхода из игры')
+        score = format_count(a['points_awarded'],'очко','очка','очков')
+        lines = [f"<b>Разбор ответов</b> · <code>{g['game_code']}</code>",
+                 f'Вопрос {pos} из {g["question_count"]}','',html.escape(q['question_snapshot']),'',
+                 '<b>Ваш ответ</b> — '+html.escape(chosen),
+                 '<b>Верный ответ</b> — '+html.escape(options[q['correct_answer_snapshot']]),
+                 'За вопрос — '+score]
         if q['explanation_snapshot']:
-            lines.append(html.escape(q['explanation_snapshot']))
+            lines.extend(['','<b>Пояснение</b>',html.escape(q['explanation_snapshot'])])
         rows=[]
         nav=[]
         if pos>1:

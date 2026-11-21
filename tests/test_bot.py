@@ -225,7 +225,7 @@ class BotTests(unittest.TestCase):
             app.review(third,gid,1)
         app.review(self.a,gid,1)
         message=json.loads(self.e.one('SELECT payload_json FROM outbox ORDER BY outbox_id DESC')[0])
-        self.assertIn('Верный ответ:',message['text'])
+        self.assertIn('Верный ответ</b> —',message['text'])
 
     def test_new_player_invite_survives_registration(self):
         gid=self.e.create(self.a['user_id'],'Все темы','mixed',5,60)
@@ -247,7 +247,7 @@ class BotTests(unittest.TestCase):
         runner.process(update,self.clock())
         self.assertEqual(self.e.one('SELECT COUNT(*) FROM outbox')[0],before)
         bad={'callback_query':{'id':'c','from':{'id':101},'message':{'chat':{'id':101,'type':'private'}},'data':'a:bad'}}
-        self.assertIn('недействительна',runner.app.handle(bad))
+        self.assertIn('устарела',runner.app.handle(bad))
 
     def test_update_offsets_are_separate_for_each_telegram_bot(self):
         old_bot=self.runner(FakeClient())
@@ -334,9 +334,9 @@ class BotTests(unittest.TestCase):
         event(101,data='history:0')
         event(101,text='/game '+game['game_code'])
         event(101,data='review:%s:1'%game['game_id'])
-        self.assertTrue(any('Ваш ник:' in p['text'] for p in payloads))
+        self.assertTrue(any('Ваш ник —' in p['text'] for p in payloads))
         self.assertTrue(any('История игр' in p['text'] for p in payloads))
-        self.assertTrue(any('Верный ответ:' in p['text'] for p in payloads))
+        self.assertTrue(any('Верный ответ</b> —' in p['text'] for p in payloads))
         self.assertTrue(all(len(p['text'])<=4096 for p in payloads))
         self.assertTrue(all(len(b['callback_data'].encode())<=64 for p in payloads
             for row in p.get('reply_markup',{}).get('inline_keyboard',[]) for b in row))
@@ -494,11 +494,11 @@ class BotTests(unittest.TestCase):
         calls=[(method,p) for method,p in client.calls if p.get('chat_id')=='101']
         self.assertEqual(sum(method=='sendMessage' for method,_ in calls),1)
         self.assertTrue(all(p.get('message_id')==message for method,p in calls if method=='editMessageText'))
-        self.assertIn('Вопрос 2/5',calls[-1][1]['text'])
+        self.assertIn('Вопрос 2 из 5',calls[-1][1]['text'])
         self.clock.advance(300)
         self.e.tick()
         flush()
-        self.assertIn('Итоги:',[p for _,p in client.calls if p.get('chat_id')=='101'][-1]['text'])
+        self.assertIn('Итоги игры',[p for _,p in client.calls if p.get('chat_id')=='101'][-1]['text'])
 
 
     def test_five_character_codes_and_collision_retry(self):
@@ -597,7 +597,7 @@ class BotTests(unittest.TestCase):
         self.assertEqual(p['current_position'],1)
         self.assertEqual(self.e.one('SELECT COUNT(*) FROM answers')[0],0)
         question=[params for method,params in client.calls if method=='sendMessage' and params.get('chat_id')=='101'][0]
-        self.assertIn('Вопрос 1/5',question['text'])
+        self.assertIn('Вопрос 1 из 5',question['text'])
         q=self.e.one('SELECT * FROM game_questions WHERE game_id=? AND position=1',(gid,))
         self.e.answer(gid,self.a['user_id'],1,q['correct_answer_snapshot'])
         score=self.e.one('SELECT points_awarded FROM answers WHERE user_id=?',(self.a['user_id'],))[0]
@@ -651,7 +651,7 @@ class BotTests(unittest.TestCase):
             'chat':{'id':101,'type':'private'},'text':'/room'}},self.clock())
         row=self.e.one("SELECT * FROM outbox WHERE kind='question' AND user_id=?",(self.a['user_id'],))
         self.assertEqual(row['position'],2)
-        self.assertIn('Вопрос 2/5',self.e.question_payload(row)['text'])
+        self.assertIn('Вопрос 2 из 5',self.e.question_payload(row)['text'])
         self.assertEqual(self.e.one("SELECT COUNT(*) FROM answers WHERE answer_status='timed_out'")[0],2)
         runner.process({'update_id':2,'message':{'from':{'id':101},
             'chat':{'id':101,'type':'private'},'text':'/room'}},self.clock())
@@ -668,7 +668,7 @@ class BotTests(unittest.TestCase):
             app.route('101','/room','',self.clock())
             row=self.e.one("SELECT * FROM outbox WHERE chat_id='101' AND slot='room'")
             payload=json.loads(row['payload_json'])
-            self.assertIn('Ожидаем',payload['text'])
+            self.assertIn('когда закончат остальные',payload['text'])
             data=[button['callback_data'] for buttons in payload['reply_markup']['inline_keyboard'] for button in buttons]
             self.assertNotIn('leave',data)
             self.assertIn('room',data)
@@ -794,7 +794,7 @@ class BotTests(unittest.TestCase):
         app=Application(self.e,'test_bot')
         app.route('101','','delete:%s'%gid,self.clock(),500)
         confirmation=json.loads(self.e.one("SELECT payload_json FROM outbox WHERE chat_id='101' AND slot='room'")[0])
-        self.assertIn('Удалить лобби',confirmation['text'])
+        self.assertIn('Удалить комнату',confirmation['text'])
         buttons=[b['callback_data'] for row in confirmation['reply_markup']['inline_keyboard'] for b in row]
         self.assertIn('delete_yes:%s'%gid,buttons)
         self.assertIn('room',buttons)
@@ -837,10 +837,10 @@ class BotTests(unittest.TestCase):
         app=Application(self.e,'test_bot')
         app.route('101','/leave','',self.clock())
         payload=json.loads(self.e.one("SELECT payload_json FROM outbox WHERE chat_id='101' AND slot='room'")[0])
-        self.assertIn('Удалить лобби',payload['text'])
+        self.assertIn('Удалить комнату',payload['text'])
         app.route('101','','room',self.clock(),500)
         payload=json.loads(self.e.one("SELECT payload_json FROM outbox WHERE chat_id='101' AND slot='room'")[0])
-        self.assertIn('Приглашение:',payload['text'])
+        self.assertIn('Как пригласить',payload['text'])
         self.assertEqual(self.e.active(self.a['user_id'])['game_id'],gid)
         buttons=[b['callback_data'] for row in payload['reply_markup']['inline_keyboard'] for b in row]
         self.assertIn('delete:%s'%gid,buttons)

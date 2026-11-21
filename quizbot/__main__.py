@@ -9,8 +9,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from .admin import parse_admin_ids
 from .app import Application
-from .db import ROOT, connect, seed_questions
+from .db import ROOT, connect, initialize_question_bank, seed_questions
 from .engine import Engine
 from .telegram import TelegramClient, TelegramError
 
@@ -59,11 +60,11 @@ class InstanceLock:
 
 
 class Runner:
-    def __init__(self,db,client,username,bot_id='default'):
+    def __init__(self,db,client,username,bot_id='default',admin_ids=()):
         self.db=db
         self.client=client
         self.engine=Engine(db)
-        self.app=Application(self.engine,username)
+        self.app=Application(self.engine,username,admin_ids)
         self.offset_key='update_offset:%s'%bot_id
         self.last_send={}
         self.api_available_at=0
@@ -271,8 +272,9 @@ class Runner:
 
 def main():
     parser=argparse.ArgumentParser(description='Telegram quiz bot')
-    parser.add_argument('--init-db',action='store_true',help='Create database and import questions without a token')
-    parser.add_argument('--import-questions',metavar='JSON',help='Import questions and exit without starting the bot')
+    bank_commands=parser.add_mutually_exclusive_group()
+    bank_commands.add_argument('--init-db',action='store_true',help='Create database and load the default bank only if empty')
+    bank_commands.add_argument('--import-questions',metavar='JSON',help='Update questions by key and exit without starting the bot')
     parser.add_argument('--network-check',action='store_true',help='Measure five read-only API requests without polling or sending messages')
     args=parser.parse_args()
     load_env()
@@ -296,24 +298,30 @@ def main():
         finally:
             client.close()
         return 0
+    admin_ids=parse_admin_ids(os.environ.get('ADMIN_IDS','')) if not (args.init_db or args.import_questions) else ()
     with InstanceLock(path):
         db=connect(path)
         try:
-            count=seed_questions(db,args.import_questions)
-            log.info('Question bank loaded: %s. Database: %s',count,path)
-            if args.init_db or args.import_questions:
+            if args.import_questions:
+                count=seed_questions(db,args.import_questions)
+                log.info('Question records imported: %s. Database: %s',count,path)
+                return 0
+            count=initialize_question_bank(db)
+            log.info('Questions in SQLite: %s. Database: %s',count,path)
+            if args.init_db:
                 return 0
             client=TelegramClient(token)
             me=client.call('getMe')
             hook=client.call('getWebhookInfo')
             if hook.get('url'):
                 raise RuntimeError('An existing webhook is configured. Remove it before starting long polling; see README.md.')
-            commands=[('start','Главное меню'),('create','Создать комнату'),('join','Войти по коду'),
-                      ('room','Текущая игра'),('profile','Мой профиль'),('history','История игр'),('nick','Сменить ник'),
-                      ('top','Общий рейтинг за месяц'),('leave','Выйти из игры'),('help','Правила')]
+            commands=[('start','Открыть главное меню'),('create','Создать комнату'),('join','Войти по коду'),
+                      ('room','Вернуться к текущей игре'),('profile','Открыть профиль'),('history','Посмотреть историю игр'),
+                      ('nick','Сменить ник'),('top','Посмотреть рейтинг за месяц'),('leave','Выйти из игры'),
+                      ('help','Как играть')]
             client.call('setMyCommands',commands=[{'command':c,'description':d} for c,d in commands])
             log.info('Bot @%s started. Stop with Ctrl+C.',me['username'])
-            Runner(db,client,me['username'],me['id']).run()
+            Runner(db,client,me['username'],me['id'],admin_ids=admin_ids).run()
         finally:
             db.close()
 

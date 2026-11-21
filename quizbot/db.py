@@ -2,7 +2,8 @@ import json
 import sqlite3
 from pathlib import Path
 
-from .migrations import upgrade_to_v4
+from .migrations import upgrade_question_schema, upgrade_to_v4
+from .questions import validate_question
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -15,8 +16,9 @@ def connect(path):
     db.execute('PRAGMA foreign_keys=ON')
     db.execute('PRAGMA journal_mode=WAL')
     db.execute('PRAGMA busy_timeout=5000')
+    db.create_function('quiz_casefold', 1, str.casefold)
     version = db.execute('PRAGMA user_version').fetchone()[0]
-    if version not in (0, 1, 2, 3, 4):
+    if version not in (0, 1, 2, 3, 4, 5, 6):
         raise RuntimeError('Unsupported database version: %s' % version)
     if version == 0 and db.execute("SELECT 1 FROM sqlite_master WHERE name='users'").fetchone():
         raise RuntimeError('Old draft database detected. Use a new DATABASE_PATH; keep the old file as a backup.')
@@ -24,6 +26,8 @@ def connect(path):
     try:
         if version in (1,2,3):
             upgrade_to_v4(db,path,schema)
+        elif version in (4,5):
+            upgrade_question_schema(db,schema,version)
         else:
             db.executescript(schema)
     except Exception:
@@ -41,17 +45,20 @@ def connect(path):
 
 def seed_questions(db, filename=None):
     data = json.loads(Path(filename or ROOT / 'data' / 'questions.json').read_text(encoding='utf-8'))
+    if not isinstance(data, list):
+        raise ValueError('The question file must contain a JSON array.')
     keys = set()
-    for q in data:
-        if q['key'] in keys or q['difficulty'] not in ('easy', 'medium', 'hard'):
-            raise ValueError('Duplicate key or invalid difficulty')
-        keys.add(q['key'])
-        if not 2 <= len(q['options']) <= 6 or not 0 <= q['correct'] < len(q['options']):
-            raise ValueError('Invalid options/answer for ' + q['key'])
-        if not q['text'].strip() or not q['topic'].strip() or len(q['text']) > 1500:
-            raise ValueError('Invalid question text/topic')
-        if any(not isinstance(v, str) or not v.strip() or len(v) > 150 for v in q['options']):
-            raise ValueError('Options must contain 1-150 characters')
+    for index, q in enumerate(data, 1):
+        if not isinstance(q, dict):
+            raise ValueError(f'Question #{index} must be a JSON object.')
+        key = q.get('key')
+        if not isinstance(key, str) or not key.strip() or key in keys:
+            raise ValueError(f'Question #{index} needs a unique, non-empty key.')
+        keys.add(key)
+        try:
+            validate_question(q)
+        except ValueError as exc:
+            raise ValueError(f'Question #{index}: {exc}') from None
     with db:
         for q in data:
             db.execute('''INSERT INTO questions
@@ -59,7 +66,16 @@ def seed_questions(db, filename=None):
                 VALUES(?,?,?,?,?,?,?) ON CONFLICT(source_key) DO UPDATE SET
                 topic=excluded.topic,difficulty=excluded.difficulty,question_text=excluded.question_text,
                 options_json=excluded.options_json,correct_answer=excluded.correct_answer,
-                explanation=excluded.explanation''',
+                explanation=excluded.explanation,revision=questions.revision+1
+                WHERE questions.topic<>excluded.topic OR questions.difficulty<>excluded.difficulty
+                   OR questions.question_text<>excluded.question_text OR questions.options_json<>excluded.options_json
+                   OR questions.correct_answer<>excluded.correct_answer OR questions.explanation<>excluded.explanation''',
                 (q['key'],q['topic'],q['difficulty'],q['text'],json.dumps(q['options'],ensure_ascii=False),
                  q['correct'],q.get('explanation','')))
     return len(data)
+
+
+def initialize_question_bank(db):
+    """Load the bundled bank only when SQLite has no questions yet."""
+    count = db.execute('SELECT COUNT(*) FROM questions').fetchone()[0]
+    return count if count else seed_questions(db)
