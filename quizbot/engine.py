@@ -89,7 +89,7 @@ class Engine:
                             (str(platform_id), nickname, normalized, now, now))
         return self.user(platform_id)
 
-    def send(self, platform_id, text, markup=None, kind='message', game_id=None, user_id=None, position=None, slot=None):
+    def send(self, platform_id, text, markup=None, kind='message', game_id=None, user_id=None, position=None, slot='room'):
         if kind=='question':
             slot='room'
         if slot:

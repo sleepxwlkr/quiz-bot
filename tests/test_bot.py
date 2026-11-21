@@ -282,10 +282,10 @@ class BotTests(unittest.TestCase):
             'from':{'id':101},'chat':{'id':101,'type':'private'},'text':'/start'}},self.clock())
         new_bot=self.runner(FakeClient())
         new_bot.offset_key='update_offset:200'
-        before=self.e.one("SELECT COUNT(*) FROM outbox")[0]
+        before=self.e.one("SELECT MAX(outbox_id) FROM outbox WHERE chat_id='101'")[0]
         new_bot.process({'update_id':1,'message':{
             'from':{'id':101},'chat':{'id':101,'type':'private'},'text':'/start'}},self.clock())
-        self.assertEqual(self.e.one('SELECT COUNT(*) FROM outbox')[0],before+1)
+        self.assertGreater(self.e.one("SELECT MAX(outbox_id) FROM outbox WHERE chat_id='101'")[0],before)
         self.assertEqual(self.e.one("SELECT value FROM settings WHERE key='update_offset:100'")[0],'9001')
         self.assertEqual(self.e.one("SELECT value FROM settings WHERE key='update_offset:200'")[0],'2')
 
@@ -321,6 +321,7 @@ class BotTests(unittest.TestCase):
         runner.engine=self.e
         runner.app=Application(self.e,'test_bot')
         update_id=0
+        payloads=[]
         def event(pid,text=None,data=None):
             nonlocal update_id
             update_id+=1
@@ -332,6 +333,9 @@ class BotTests(unittest.TestCase):
             else:
                 update['callback_query']={'id':str(update_id),'from':{'id':pid},'message':message,'data':data}
             runner.process(update,self.clock())
+            response=self.e.one("SELECT payload_json FROM outbox WHERE chat_id=? AND slot='room'",(str(pid),))
+            if response:
+                payloads.append(json.loads(response[0]))
         event(101,data='create')
         token=self.e.state(101)['token']
         event(101,data='w:%s:count:5'%token)
@@ -356,7 +360,6 @@ class BotTests(unittest.TestCase):
         event(101,data='history:0')
         event(101,text='/game '+game['game_code'])
         event(101,data='review:%s:1'%game['game_id'])
-        payloads=[json.loads(r[0]) for r in self.e.all('SELECT payload_json FROM outbox')]
         self.assertTrue(any('Средние очки:' in p['text'] for p in payloads))
         self.assertTrue(any('История игр' in p['text'] for p in payloads))
         self.assertTrue(any('Верный ответ:' in p['text'] for p in payloads))
@@ -780,7 +783,7 @@ class BotTests(unittest.TestCase):
         def request(number):
             runner.process({'update_id':number,'message':{'from':{'id':101},
                 'chat':{'id':101,'type':'private'},'text':'/room'}},self.clock())
-            last=json.loads(self.e.one('SELECT payload_json FROM outbox ORDER BY outbox_id DESC')[0])
+            last=json.loads(self.e.one("SELECT payload_json FROM outbox WHERE chat_id='101' AND slot='room'")[0])
             self.assertIn('нет активной игры',last['text'])
             self.assertIn('/history',last['text'])
         request(1)

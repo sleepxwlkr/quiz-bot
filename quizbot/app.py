@@ -38,17 +38,51 @@ class Application:
         except RuleError as exc:
             if callback:
                 return str(exc)
-            self.e.send(pid,html.escape(str(exc)))
+            self.show_error(pid,html.escape(str(exc)),text)
             return ''
         except (ValueError,IndexError,KeyError):
             # Stale or fabricated callback data must not poison the update queue.
             message='Эта кнопка недействительна. Откройте /menu заново.'
             if callback:
                 return message
-            self.e.send(pid,message)
+            self.show_error(pid,message,text)
             return ''
 
+    def pending_response(self,pid):
+        return self.e.one("SELECT * FROM outbox WHERE chat_id=? AND slot='room' ORDER BY outbox_id DESC LIMIT 1",
+                          (str(pid),))
+
+    def present_response(self,pid,before,text,data,message_id):
+        response=self.pending_response(pid)
+        if response is None or (before is not None and before['outbox_id']==response['outbox_id']):
+            return
+        # Answers advance the existing game screen; every other button uses
+        # the message actually clicked. Text input moves the screen to the bottom.
+        if data.startswith('a:') or (not text and message_id is None):
+            return
+        current=self.e.one("SELECT message_id FROM ui_messages WHERE chat_id=? AND slot='room'",(str(pid),))
+        if message_id is not None and current and current[0]==message_id:
+            return
+        previous=self.e.retarget_panel(pid,message_id)
+        payload=json.loads(response['payload_json'])
+        payload['_panel_epoch']=self.e.panel_epoch(pid)
+        self.e.db.execute('UPDATE outbox SET payload_json=? WHERE outbox_id=?',
+                          (json.dumps(payload,ensure_ascii=False),response['outbox_id']))
+        self.e.remove_old_panel(pid,previous)
+
+    def show_error(self,pid,text,input_text):
+        before=self.pending_response(pid)
+        self.e.send(pid,text,menu() if self.e.user(pid) else None)
+        self.present_response(pid,before,input_text,'',None)
+
     def route(self, pid, text, data, received_at, message_id=None):
+        before=self.pending_response(pid)
+        try:
+            return self._route(pid,text,data,received_at,message_id)
+        finally:
+            self.present_response(pid,before,text,data,message_id)
+
+    def _route(self, pid, text, data, received_at, message_id=None):
         state = self.e.state(pid)
         parts = text.split(maxsplit=1)
         cmd = parts[0].split('@')[0].lower() if parts and parts[0].startswith('/') else ''
@@ -76,8 +110,7 @@ class Application:
         self.e.db.execute('UPDATE users SET last_seen_at=? WHERE user_id=?',(self.e.clock(),uid))
         if cmd in ('/start','/menu','/cancel') or data=='menu':
             self.e.set_state(pid,{})
-            self.e.send(pid,'Выберите действие. /cancel сбрасывает ввод; для выхода из игры — /leave.',menu(),
-                        slot='room' if state.get('step') in ('wizard','confirm_leave') else None)
+            self.e.send(pid,'Выберите действие. /cancel сбрасывает ввод; для выхода из игры — /leave.',menu())
         elif cmd=='/help' or data=='help':
             self.e.send(pid,'<b>Квиз-бот</b>\n\n'
                 'Комната: 2–10 игроков, общая тема и настройки, запуск создателем. '
@@ -103,14 +136,12 @@ class Application:
         elif cmd=='/create' or data=='create':
             if self.e.active(uid):
                 raise RuleError('Вы уже в игре. Откройте /room или выйдите через /leave.')
-            previous_panel=self.e.retarget_panel(pid,message_id)
             topics = [r[0] for r in self.e.all('SELECT DISTINCT topic FROM questions WHERE is_active=1 ORDER BY topic')]
             topics.insert(0,'Все темы')
             state = {'step':'wizard','token':secrets.token_hex(3),'topics':topics,
                      'topic':0,'difficulty':'mixed','count':10,'seconds':60}
             self.e.set_state(pid,state)
             self.wizard(pid,state)
-            self.e.remove_old_panel(pid,previous_panel)
         elif data.startswith('w:'):
             self.wizard_action(u,data,state)
         elif cmd=='/join' or data=='join':
@@ -122,22 +153,18 @@ class Application:
         elif cmd=='/duel' or data=='duel':
             if self.e.active(uid):
                 raise RuleError('Вы уже участвуете в игре. Откройте /room.')
-            previous_panel=self.e.retarget_panel(pid,message_id)
             self.e.set_state(pid,{})
             self.e.send(pid,'<b>Дуэли</b>\nНайти соперника или отправить вызов другу?\n'
                         'Оба варианта: 10 вопросов, 60 секунд на вопрос, рейтинг Elo.',
                         keyboard([('Найти соперника','duel_search')],[('Вызвать друга','duel_friend')],[('Назад','menu')]),slot='room')
-            self.e.remove_old_panel(pid,previous_panel)
         elif data in ('duel_search','duel_friend') or cmd=='/challenge':
             self.begin_duel(u,data=='duel_friend' or cmd=='/challenge',message_id)
         elif cmd=='/room' or data=='room' or data.startswith('lobby:'):
             g = self.e.active(uid)
             if not g:
                 raise RuleError('У вас нет активной игры. Создайте комнату или выберите дуэль. Результаты прошлых игр: /history.')
-            previous_panel=self.e.retarget_panel(pid,message_id)
             self.e.set_state(pid,{})
             self.lobby(u,g['game_id'])
-            self.e.remove_old_panel(pid,previous_panel)
         elif data.startswith('start:'):
             self.e.start(int(data.split(':')[1]),uid)
         elif data.startswith('delete:'):
@@ -169,11 +196,9 @@ class Application:
                 self.confirm_leave(u,g,message_id)
                 return ''
             self.e.leave(uid)
-            previous_panel=self.e.retarget_panel(pid,message_id)
             self.e.set_state(pid,{})
             self.e.send(pid,('Вы покинули комнату.' if g['status']=='lobby' else 'Вы вышли из игры.')+
                         '\n\nГлавное меню:',menu(),slot='room')
-            self.e.remove_old_panel(pid,previous_panel)
             if g['status']=='lobby':
                 for participant in self.e.participants(g['game_id']):
                     self.lobby(self.e.user(participant['platform_user_id']),g['game_id'])
@@ -215,7 +240,6 @@ class Application:
                                (g['game_id'],u['user_id']))
         if not participant or participant[0] not in ('joined','playing'):
             raise RuleError('Ваш тест уже завершён. Дождитесь итогов общей игры.')
-        previous_panel=self.e.retarget_panel(u['platform_user_id'],message_id)
         token=secrets.token_hex(4)
         self.e.set_state(u['platform_user_id'],{'step':'confirm_leave','game_id':g['game_id'],
                                               'phase':g['status'],'token':token})
@@ -227,27 +251,21 @@ class Application:
                 text+=' В дуэли засчитается сдача.'
         self.e.send(u['platform_user_id'],text,
                     keyboard([('Да, выйти','leave_yes:%s:%s'%(g['game_id'],token)),('Отмена','room')]),slot='room')
-        self.e.remove_old_panel(u['platform_user_id'],previous_panel)
 
     def confirm_lobby_deletion(self,u,gid,message_id):
         g=self.e.owned_lobby(gid,u['user_id'])
-        previous_panel=self.e.retarget_panel(u['platform_user_id'],message_id)
         self.e.send(u['platform_user_id'],'Удалить лобби <code>%s</code>?\n'
                     'Оно закроется для всех участников.'%g['game_code'],
                     keyboard([('Да, удалить','delete_yes:%s'%gid),('Отмена','room')]),slot='room')
-        self.e.remove_old_panel(u['platform_user_id'],previous_panel)
 
     def delete_lobby(self,u,gid,message_id):
         self.e.delete_lobby(gid,u['user_id'])
-        previous_panel=self.e.retarget_panel(u['platform_user_id'],message_id)
         self.e.set_state(u['platform_user_id'],{})
         self.e.send(u['platform_user_id'],'Лобби удалено.\n\nГлавное меню:',menu(),slot='room')
-        self.e.remove_old_panel(u['platform_user_id'],previous_panel)
 
     def begin_duel(self,u,invite,message_id):
         if self.e.active(u['user_id']):
             raise RuleError('Вы уже участвуете в игре. Откройте /room или выйдите через /leave.')
-        previous_panel=self.e.retarget_panel(u['platform_user_id'],message_id)
         if invite:
             gid=self.e.challenge(u['user_id'])
             started=False
@@ -256,11 +274,9 @@ class Application:
         self.e.set_state(u['platform_user_id'],{})
         if not started:
             self.lobby(u,gid)
-        self.e.remove_old_panel(u['platform_user_id'],previous_panel)
 
     def join(self, u, code):
         gid = self.e.join(u['user_id'],code)
-        previous_panel=self.e.retarget_panel(u['platform_user_id'])
         self.e.set_state(u['platform_user_id'],{})
         g = self.e.one('SELECT * FROM games WHERE game_id=?',(gid,))
         if g['mode']=='duel' and len(self.e.participants(gid))==2:
@@ -268,7 +284,6 @@ class Application:
         else:
             for p in self.e.participants(gid):
                 self.lobby(self.e.user(p['platform_user_id']),gid)
-        self.e.remove_old_panel(u['platform_user_id'],previous_panel)
 
     def wizard(self, pid, state):
         token = state['token']

@@ -174,6 +174,10 @@ class Runner:
                 break
             if row['chat_id'] in busy or now-self.last_send.get(row['chat_id'],0)<1.05:
                 continue
+            if row['slot'] and json.loads(row['payload_json']).get('_panel_epoch',0)!=self.engine.panel_epoch(row['chat_id']):
+                with self.db:
+                    self.db.execute('DELETE FROM outbox WHERE outbox_id=?',(row['outbox_id'],))
+                continue
             payload=self.engine.question_payload(row) if row['kind']=='question' else json.loads(row['payload_json'])
             if payload is None:
                 with self.db:
