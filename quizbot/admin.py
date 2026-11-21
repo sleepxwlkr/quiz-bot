@@ -16,7 +16,9 @@ MAX_EXPLANATION = 1200
 FIELDS = ('text', 'topic', 'difficulty', 'options', 'correct', 'explanation')
 ADD_FIELDS = ('text', 'options', 'correct', 'explanation')
 FIELD_LABELS = dict(zip(FIELDS, ('Текст', 'Тема', 'Сложность', 'Варианты', 'Верный ответ', 'Пояснение')))
-ACTIONS = {'add': 'Добавлен', 'edit': 'Изменён', 'enable': 'Включён', 'disable': 'Отключён'}
+ACTIONS = {'add': 'Добавлен', 'edit': 'Изменён', 'enable': 'Включён', 'disable': 'Отключён', 'delete': 'Удалён'}
+TOPIC_PICKERS = {'topics': 'topic', 'rename_topics': 'rename', 'delete_topics': 'delete_topic'}
+ADMIN_VERSION = 3
 
 
 def parse_admin_ids(value):
@@ -60,7 +62,7 @@ class QuestionAdmin:
             self.home(pid, {})
         elif command == '/cancel':
             self.home(pid, state, 'Действие отменено.')
-        elif state.get('admin_version') != 2:
+        elif state.get('admin_version') != ADMIN_VERSION:
             raise RuleError('Меню изменилось. Откройте /admin заново.')
         elif data:
             parts = data.split(':')
@@ -69,7 +71,7 @@ class QuestionAdmin:
                 raise RuleError('Кнопка устарела. Откройте /admin заново.')
             action = parts[2]
             value = parts[3] if len(parts) == 4 else None
-            if action in ('open', 'topic', 'rename') and (
+            if action in ('open', 'topic', 'rename', 'delete_topic') and (
                     value is None or not value.isascii() or not value.isdecimal()
                     or len(value)>19 or int(value)>=2**63):
                 raise RuleError('Выберите строку из списка.')
@@ -87,7 +89,7 @@ class QuestionAdmin:
 
     def home(self, pid, state, note=''):
         page = state.get('topic_page', 0)
-        state = {'step': 'admin', 'admin_version': 2}
+        state = {'step': 'admin', 'admin_version': ADMIN_VERSION}
         self.show_topics(pid, state, page, note=note)
 
     def callback(self, pid, state, action, value):
@@ -97,13 +99,13 @@ class QuestionAdmin:
             self.e.send(pid, '<b>Главное меню</b>\nВыберите действие.', self.player_menu())
         elif action == 'home':
             self.home(pid, state)
-        elif action == 'topics' and screen in ('topics', 'rename_topics'):
+        elif action == 'topics' and screen in TOPIC_PICKERS:
             page = state.get('topic_page', 0)
             if value in ('prev', 'next'):
                 page = max(0, page + (1 if value == 'next' else -1))
-            self.show_topics(pid, state, page, renaming=screen=='rename_topics')
-        elif action == 'rename_topics' and screen == 'topics':
-            self.show_topics(pid, state, state.get('topic_page', 0), renaming=True)
+            self.show_topics(pid, state, page, screen)
+        elif action in ('rename_topics', 'delete_topics') and screen == 'topics':
+            self.show_topics(pid, state, state.get('topic_page', 0), action)
         elif action == 'topic' and screen == 'topics':
             state['topic_id'] = int(value)
             self.show_difficulties(pid, state)
@@ -117,6 +119,10 @@ class QuestionAdmin:
             self.ask_topic_name(pid, state)
         elif action == 'save_topic' and screen == 'topic_preview':
             self.save_topic(pid, state)
+        elif action == 'delete_topic' and screen == 'delete_topics':
+            self.confirm_topic_deletion(pid, state, self.topic(int(value)))
+        elif action == 'apply_topic_deletion' and screen == 'confirm_topic_deletion':
+            self.apply_topic_deletion(pid, state)
         elif action == 'difficulties' and screen == 'list':
             self.show_difficulties(pid, state)
         elif action == 'difficulty' and screen == 'difficulties' and value in QUESTION_DIFFICULTIES:
@@ -137,11 +143,13 @@ class QuestionAdmin:
         elif action == 'add' and screen == 'list':
             topic = self.topic(state['topic_id'])
             state['draft'] = {'topic': topic['name'], 'difficulty': state['difficulty']}
-            state['adding'] = True
+            state.update(adding=True, draft_topic_id=topic['topic_id'])
             self.ask_field(pid, state, 'text')
         elif action == 'edit' and screen == 'question':
             question = self.question(state['question_id'])
-            state.update(draft=self.bank.draft(question), revision=question['revision'], adding=False)
+            topic = self.bank.topic_by_name(question['topic'])
+            state.update(draft=self.bank.draft(question), revision=question['revision'], adding=False,
+                         draft_topic_id=topic['topic_id'])
             self.preview(pid, state)
         elif action == 'field' and screen == 'preview' and value in FIELDS:
             self.ask_field(pid, state, value)
@@ -153,7 +161,11 @@ class QuestionAdmin:
             self.confirm_toggle(pid, state)
         elif action == 'apply_toggle' and screen == 'confirm_toggle':
             self.apply_toggle(pid, state)
-        elif action == 'back_question' and screen == 'confirm_toggle':
+        elif action == 'delete_question' and screen == 'question':
+            self.confirm_question_deletion(pid, state)
+        elif action == 'apply_question_deletion' and screen == 'confirm_question_deletion':
+            self.apply_question_deletion(pid, state)
+        elif action == 'back_question' and screen in ('confirm_toggle', 'confirm_question_deletion'):
             self.show_question(pid, state, self.question(state['question_id']))
         elif action == 'log' and screen in ('topics', 'log'):
             page = state.get('log_page', 0) if screen == 'log' else 0
@@ -163,13 +175,19 @@ class QuestionAdmin:
         else:
             raise RuleError('Кнопка устарела. Откройте /admin заново.')
 
-    def show_list(self, pid, state):
-        filters, page = self.scope_filters(state), state['page']
+    def show_list(self, pid, state, note=''):
+        topic = self.bank.topic(state['topic_id'])
+        if topic is None:
+            self.home(pid, state, 'Эта тема уже удалена.')
+            return
+        filters, page = self.scope_filters(state, topic), state['page']
         questions = self.bank.list(filters, PAGE_SIZE+1, page*PAGE_SIZE)
         if page and not questions:
             page = state['page'] = 0
             questions = self.bank.list(filters, PAGE_SIZE+1, 0)
         lines = [f'<b>Вопросы · страница {page+1}</b>', self.filter_summary(filters)]
+        if note:
+            lines.extend(['', note])
         rows = []
         for question in questions[:PAGE_SIZE]:
             qid = question['question_id']
@@ -184,8 +202,8 @@ class QuestionAdmin:
                      [('К сложности', 'difficulties'), ('К темам', 'home')]])
         self.view(pid, state, 'list', '\n'.join(lines), rows)
 
-    def scope_filters(self, state):
-        return {**state['filters'], 'topic': self.topic(state['topic_id'])['name'], 'difficulty': state['difficulty']}
+    def scope_filters(self, state, topic):
+        return {**state['filters'], 'topic': topic['name'], 'difficulty': state['difficulty']}
 
     def filter_summary(self, filters):
         topic = shorten(filters.get('topic', 'Все темы'), 70, single_line=True)
@@ -203,7 +221,7 @@ class QuestionAdmin:
         self.view(pid, state, 'search', body, [[('К списку', 'list')]])
 
     def show_filters(self, pid, state):
-        body = '<b>Фильтры</b>\n'+self.filter_summary(self.scope_filters(state))
+        body = '<b>Фильтры</b>\n'+self.filter_summary(self.scope_filters(state, self.topic(state['topic_id'])))
         rows = [
             [('Включённые', 'active:1'), ('Отключённые', 'active:0'), ('Все статусы', 'active:all')],
             [('Сбросить поиск и фильтры', 'reset')],
@@ -211,26 +229,32 @@ class QuestionAdmin:
         ]
         self.view(pid, state, 'filters', body, rows)
 
-    def show_topics(self, pid, state, page, renaming=False, note=''):
+    def show_topics(self, pid, state, page, screen='topics', note=''):
         topics = self.bank.topics(TOPIC_PAGE_SIZE+1, page*TOPIC_PAGE_SIZE)
+        if page and not topics:
+            page = 0
+            topics = self.bank.topics(TOPIC_PAGE_SIZE+1, 0)
         state['topic_page'] = page
-        action = 'rename' if renaming else 'topic'
+        action = TOPIC_PICKERS[screen]
         rows = [[(shorten(topic['name'], 52, single_line=True), f"{action}:{topic['topic_id']}")]
                 for topic in topics[:TOPIC_PAGE_SIZE]]
         rows.extend(pager(page, len(topics)>TOPIC_PAGE_SIZE, 'topics'))
-        if renaming:
-            body = '<b>Какую тему переименовать?</b>'
+        if screen != 'topics':
+            verb = 'переименовать' if screen == 'rename_topics' else 'удалить'
+            body = f'<b>Какую тему {verb}?</b>'
             rows.append([('К темам', 'home')])
         else:
             body = '<b>Банк вопросов · Темы</b>\n'+('Выберите тему, чтобы открыть её вопросы.' if topics
                                                     else 'Создайте первую тему, чтобы добавить в неё вопросы.')
             manage = [('Создать тему', 'new_topic')]
+            rows.append(manage)
             if topics:
                 manage.append(('Переименовать тему', 'rename_topics'))
-            rows.extend([manage, [('Журнал изменений', 'log'), ('Главное меню', 'exit')]])
+                rows.append([('Удалить тему', 'delete_topics')])
+            rows.append([('Журнал изменений', 'log'), ('Главное меню', 'exit')])
         if note:
             body += '\n\n'+note
-        self.view(pid, state, 'rename_topics' if renaming else 'topics', body, rows)
+        self.view(pid, state, screen, body, rows)
 
     def topic(self, topic_id):
         topic = self.bank.topic(topic_id)
@@ -291,6 +315,24 @@ class QuestionAdmin:
         state['topic_page'] = 0
         self.home(pid, state, note)
 
+    def confirm_topic_deletion(self, pid, state, topic):
+        state.update(topic_id=topic['topic_id'], topic_revision=topic['revision'])
+        name = html.escape(shorten(topic['name'], MAX_TOPIC))
+        body = (f'<b>Удалить тему «{name}»?</b>\n\n'
+                'Из банка исчезнут тема и все её вопросы, включая отключённые. '
+                'Уже начатые игры и их результаты сохранятся. '
+                'Для новых игр выберите другую тему.')
+        self.view(pid, state, 'confirm_topic_deletion', body,
+                  [[('Да, удалить', 'apply_topic_deletion'), ('Отмена', 'home')]])
+
+    def apply_topic_deletion(self, pid, state):
+        try:
+            self.bank.delete_topic(state['topic_id'], state['topic_revision'], pid, self.e.clock())
+            note = 'Тема и её вопросы удалены.'
+        except QuestionChanged:
+            note = 'Тема уже изменилась или была удалена. Проверьте список тем.'
+        self.home(pid, state, note)
+
     def change_filter(self, pid, state, key, value):
         filters = state['filters']
         if key == 'reset':
@@ -322,7 +364,7 @@ class QuestionAdmin:
         return '\n'.join(lines)
 
     def show_question(self, pid, state, question, note=''):
-        for key in ('draft', 'adding', 'field', 'revision', 'target_active'):
+        for key in ('draft', 'draft_topic_id', 'adding', 'field', 'revision', 'target_active'):
             state.pop(key, None)
         qid = question['question_id']
         active = question['is_active']
@@ -335,6 +377,7 @@ class QuestionAdmin:
         state.update(question_id=qid)
         self.view(pid, state, 'question', body, [
             [('Редактировать', 'edit'), ('Отключить' if active else 'Включить', 'toggle')],
+            [('Удалить вопрос', 'delete_question')],
             [('К списку', 'list'), ('В админку', 'home')],
         ])
 
@@ -433,6 +476,8 @@ class QuestionAdmin:
         draft = state['draft']
         if field == 'options' and draft.get('options') != value:
             draft.pop('correct', None)
+        if field == 'topic':
+            state['draft_topic_id'] = self.bank.topic_by_name(value)['topic_id']
         draft[field] = value
         missing = next((key for key in FIELDS if key not in draft), None)
         if missing is None:
@@ -451,8 +496,9 @@ class QuestionAdmin:
 
     def save(self, pid, state):
         qid = None if state['adding'] else state['question_id']
-        if self.bank.topic_by_name(state['draft']['topic']) is None:
-            raise RuleError('Название темы изменилось. Выберите поле «Тема» и укажите новое название.')
+        topic = self.bank.topic(state['draft_topic_id'])
+        if topic is None or topic['name'] != state['draft']['topic']:
+            raise RuleError('Тема изменилась или была удалена. Выберите поле «Тема» и укажите действующее название.')
         try:
             if qid is not None:
                 current = self.question(qid)
@@ -488,6 +534,23 @@ class QuestionAdmin:
             note = 'Вопрос уже изменился. Проверьте его текущий статус.'
         self.show_question(pid, state, self.question(qid), note)
 
+    def confirm_question_deletion(self, pid, state):
+        question = self.question(state['question_id'])
+        state['revision'] = question['revision']
+        text = html.escape(shorten(question['question_text'], 180, single_line=True))
+        body = (f'<b>Удалить вопрос #{question["question_id"]}?</b>\n\n{text}\n\n'
+                'Вопрос исчезнет из банка и новых игр. В сыгранных и уже начатых играх он сохранится.')
+        self.view(pid, state, 'confirm_question_deletion', body,
+                  [[('Да, удалить', 'apply_question_deletion'), ('Отмена', 'back_question')]])
+
+    def apply_question_deletion(self, pid, state):
+        try:
+            self.bank.delete_question(state['question_id'], state['revision'], pid, self.e.clock())
+            note = 'Вопрос удалён.'
+        except QuestionChanged:
+            note = 'Вопрос уже изменился или был удалён. Проверьте список вопросов.'
+        self.show_list(pid, state, note)
+
     def show_log(self, pid, state, page):
         entries = self.bank.log_page(PAGE_SIZE+1, page*PAGE_SIZE)
         state['log_page'] = page
@@ -495,8 +558,12 @@ class QuestionAdmin:
         for entry in entries[:PAGE_SIZE]:
             date = datetime.fromtimestamp(entry['occurred_at'], timezone.utc)
             actor = html.escape(entry['actor_telegram_id'])
-            lines.extend(['', f"{date:%d.%m.%Y %H:%M} · {ACTIONS[entry['action']]} вопрос #{entry['question_id']}",
-                          f'Администратор · <code>{actor}</code>'])
+            if entry['action'] == 'delete_topic':
+                name = html.escape(shorten(entry['topic_name'], MAX_TOPIC))
+                action = f'Удалена тема «{name}»'
+            else:
+                action = f"{ACTIONS[entry['action']]} вопрос #{entry['question_id']}"
+            lines.extend(['', f'{date:%d.%m.%Y %H:%M} · {action}', f'Администратор · <code>{actor}</code>'])
         if not entries:
             lines.append('\nИзменений через Telegram пока нет.')
         rows = pager(page, len(entries)>PAGE_SIZE, 'log') + [[('К темам', 'home')]]

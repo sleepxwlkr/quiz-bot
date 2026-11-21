@@ -1,4 +1,4 @@
-"""Database upgrades. Versions 1–3 require a rebuild, version 4 is additive."""
+"""Database upgrades for game history and question administration."""
 import logging
 import sqlite3
 import time
@@ -83,7 +83,23 @@ def upgrade_question_schema(db, schema, version):
         db.execute('BEGIN IMMEDIATE')
         if version == 4:
             db.execute('ALTER TABLE questions ADD COLUMN revision INTEGER NOT NULL DEFAULT 0 CHECK(revision>=0)')
+        db.execute('ALTER TABLE questions ADD COLUMN deleted_at REAL CHECK(deleted_at IS NULL OR is_active=0)')
+        if version == 6:
+            db.execute('DROP TRIGGER question_topic_after_insert')
+            db.execute('DROP TRIGGER question_topic_after_update')
+            db.execute('ALTER TABLE question_topics RENAME TO _old_question_topics')
+        if version >= 5:
+            db.execute('ALTER TABLE question_admin_log RENAME TO _old_question_admin_log')
         execute_schema(db, schema)
+        if version == 6:
+            db.execute('''INSERT INTO question_topics(topic_id,name,revision)
+                SELECT topic_id,name,revision FROM _old_question_topics''')
+            db.execute('DROP TABLE _old_question_topics')
+        db.execute('INSERT OR IGNORE INTO question_topics(name) SELECT DISTINCT topic FROM questions')
+        if version >= 5:
+            db.execute('''INSERT INTO question_admin_log(log_id,actor_telegram_id,question_id,action,occurred_at)
+                SELECT log_id,actor_telegram_id,question_id,action,occurred_at FROM _old_question_admin_log''')
+            db.execute('DROP TABLE _old_question_admin_log')
         if db.execute('PRAGMA foreign_key_check').fetchone():
             raise RuntimeError('Database migration failed the foreign key check')
         db.commit()

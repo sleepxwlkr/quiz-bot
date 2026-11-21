@@ -227,7 +227,8 @@ class Engine:
             raise RuleError('Для игры нужно хотя бы два игрока. Поделитесь ссылкой или кодом комнаты.')
         bank = self.available_questions(g['topic'],g['difficulty'])
         if len(bank) < g['question_count']:
-            raise RuleError('Для этих настроек уже не хватает вопросов. Создайте комнату с меньшим числом вопросов.')
+            raise RuleError('Для этих настроек уже не хватает вопросов. Создайте комнату с другой темой, '
+                            'сложностью или меньшим числом вопросов.')
         for pos,q in enumerate(random.SystemRandom().sample(bank,g['question_count']),1):
             options = json.loads(q['options_json'])
             order = list(range(len(options)))

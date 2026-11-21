@@ -417,40 +417,173 @@ class AdminTests(unittest.TestCase):
         self.open_questions('Программирование', 'Лёгкая')
         self.assertIn('Программирование', self.screen()['text'])
 
+    def test_question_deletion_needs_confirmation_and_keeps_saved_game_snapshots(self):
+        seed_questions(self.db)
+        owner = self.e.register(101, 'Алиса')['user_id']
+        guest = self.e.register(202, 'Борис')['user_id']
+        gid = self.e.create(owner, 'Информатика', 'easy', 5, 60)
+        self.e.join(guest, self.e.active(owner)['game_code'])
+        self.e.start(gid, owner)
+        snapshot = tuple(self.e.one('SELECT * FROM game_questions WHERE game_id=? AND position=1', (gid,)))
+        question_id = snapshot[2]
+        bank = QuestionBank(self.db)
+        key = bank.get(question_id)['source_key']
+
+        self.open_questions('Информатика', 'Лёгкая')
+        self.press('Поиск')
+        self.update(text=bank.get(question_id)['question_text'])
+        button = next(button['callback_data'] for row in self.screen()['reply_markup']['inline_keyboard']
+                      for button in row if button['callback_data'].endswith(f':open:{question_id}'))
+        self.update(data=button)
+        self.press('Удалить вопрос')
+        confirmation = self.button('Да, удалить')
+        self.assertIn('нет доступа', self.update(data=confirmation, user=303))
+        self.press('Отмена')
+        self.assertIn('устарела', self.update(data=confirmation))
+        self.assertIsNotNone(bank.get(question_id))
+
+        self.press('Удалить вопрос')
+        self.press('Да, удалить')
+        self.assertIn('Вопрос удалён.', self.screen()['text'])
+        self.assertNotIn(f'#{question_id}', self.screen()['text'])
+        self.assertNotIn(question_id, [q['question_id'] for q in self.e.available_questions('Информатика', 'easy')])
+        self.assertEqual(tuple(self.e.one('SELECT * FROM game_questions WHERE game_id=? AND position=1', (gid,))),
+                         snapshot)
+        self.press('К темам')
+        self.press('Журнал изменений')
+        self.assertIn(f'Удалён вопрос #{question_id}', self.screen()['text'])
+        self.clock.advance(301)
+        with self.db:
+            self.e.tick()
+        self.assertEqual(self.e.one('SELECT status FROM games WHERE game_id=?', (gid,))[0], 'completed')
+
+        self.close()
+        self.open()
+        self.assertEqual(initialize_question_bank(self.db), 59)
+        self.assertEqual(seed_questions(self.db), 59)
+        self.assertIsNone(QuestionBank(self.db).get(question_id))
+        self.assertEqual(self.e.one('SELECT source_key FROM questions WHERE question_id=?', (question_id,))[0], key)
+
+    def test_topic_deletion_hides_all_its_questions_and_allows_a_new_topic_with_the_same_name(self):
+        active = self.put_question('a', 'Космос', 'easy', 'Звезда')
+        inactive = self.put_question('b', 'Космос', 'hard', 'Галактика', active=0)
+        self.put_question('c', 'История', 'easy', 'Век')
+        bank = QuestionBank(self.db)
+        topic_id = bank.topic_by_name('Космос')['topic_id']
+
+        self.update(text='/admin')
+        self.press('Удалить тему')
+        self.press('Космос')
+        self.assertIn('включая отключённые', self.screen()['text'])
+        self.press('Отмена')
+        self.assertIsNotNone(bank.topic(topic_id))
+
+        self.press('Удалить тему')
+        self.press('Космос')
+        self.press('Да, удалить')
+        self.assertIn('Тема и её вопросы удалены.', self.screen()['text'])
+        self.assertIsNone(bank.topic(topic_id))
+        self.assertIsNone(bank.get(active))
+        self.assertIsNone(bank.get(inactive))
+        self.assertEqual([q['topic'] for q in self.e.available_questions('Все темы', 'mixed')], ['История'])
+        self.press('Журнал изменений')
+        self.assertIn('Удалена тема «Космос»', self.screen()['text'])
+
+        file = self.path.with_suffix('.json')
+        questions = [dict(key=key, topic='Космос', difficulty='easy', text='Вопрос', options=['A','B'], correct=0)
+                     for key in ('a', 'b', 'new')]
+        file.write_text(json.dumps(questions), encoding='utf-8')
+        self.assertEqual(seed_questions(self.db, file), 0)
+        self.close()
+        self.open()
+        bank = QuestionBank(self.db)
+        self.assertIsNone(bank.topic_by_name('Космос'))
+        self.create_topic('Космос')
+        self.assertNotEqual(bank.topic_by_name('Космос')['topic_id'], topic_id)
+        self.assertEqual(seed_questions(self.db, file), 1)
+        self.assertEqual([q['source_key'] for q in self.e.available_questions('Космос', 'mixed')], ['new'])
+
+    def test_confirmation_cannot_delete_a_topic_that_was_renamed(self):
+        self.create_topic('Астрономия')
+        self.press('Удалить тему')
+        self.press('Астрономия')
+        confirmation = self.button('Да, удалить')
+        self.update(text='/admin', user=202)
+        self.press('Переименовать тему', user=202)
+        self.press('Астрономия', user=202)
+        self.update(text='Космос', user=202)
+        self.press('Подтвердить', user=202)
+        self.update(data=confirmation)
+        self.assertIn('Тема уже изменилась', self.screen()['text'])
+        self.assertIsNotNone(QuestionBank(self.db).topic_by_name('Космос'))
+        self.press('Удалить тему')
+        self.press('Космос')
+        self.press('Да, удалить')
+        self.assertIsNone(QuestionBank(self.db).topic_by_name('Космос'))
+
 
 class AdminMigrationTests(unittest.TestCase):
-    def test_v5_upgrade_backfills_topics_without_rewriting_questions_or_audit(self):
+    def legacy_schema(self, version):
         schema = (ROOT/'quiz_bot_schema.sql').read_text(encoding='utf-8')
-        schema = (schema[:schema.index('CREATE TABLE IF NOT EXISTS question_topics')]
-                  +schema[schema.index('CREATE TABLE IF NOT EXISTS games'):])
-        schema = schema.replace('PRAGMA user_version = 6;', 'PRAGMA user_version = 5;')
+        questions = schema[:schema.index('CREATE TABLE IF NOT EXISTS question_topics')]
+        questions = questions.replace(',\n    deleted_at REAL CHECK(deleted_at IS NULL OR is_active=0)', '')
+        if version == 4:
+            questions = questions.replace(',\n    revision INTEGER NOT NULL DEFAULT 0 CHECK(revision>=0)', '')
+        else:
+            questions += '''CREATE TABLE question_admin_log (
+                log_id INTEGER PRIMARY KEY, actor_telegram_id TEXT NOT NULL,
+                question_id INTEGER NOT NULL REFERENCES questions(question_id) ON DELETE RESTRICT,
+                action TEXT NOT NULL CHECK(action IN ('add','edit','enable','disable')), occurred_at REAL NOT NULL
+            );\n'''
+        if version == 6:
+            questions += '''CREATE TABLE question_topics (
+                topic_id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, revision INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TRIGGER question_topic_after_insert AFTER INSERT ON questions BEGIN
+                INSERT OR IGNORE INTO question_topics(name) VALUES(NEW.topic);
+            END;
+            CREATE TRIGGER question_topic_after_update AFTER UPDATE OF topic ON questions BEGIN
+                INSERT OR IGNORE INTO question_topics(name) VALUES(NEW.topic);
+            END;
+            '''
+        games = schema[schema.index('CREATE TABLE IF NOT EXISTS games'):]
+        return questions + games.replace('PRAGMA user_version = 7;', f'PRAGMA user_version = {version};')
+
+    def test_upgrade_keeps_audit_and_backfills_only_missing_topics(self):
+        for version in (5, 6):
+            with self.subTest(version=version):
+                self.check_topic_upgrade(version)
+
+    def check_topic_upgrade(self, version):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'v5.db'
+            path = Path(directory) / f'v{version}.db'
             with closing(sqlite3.connect(path)) as old:
-                old.executescript(schema)
-                seed_questions(old)
-                QuestionBank(old).set_active(1, 0, 0, '101', Clock()())
+                old.executescript(self.legacy_schema(version))
+                old.execute('''INSERT INTO questions(source_key,topic,difficulty,question_text,options_json,
+                    correct_answer,is_active,revision) VALUES('old','История','easy','Вопрос','["Да","Нет"]',0,0,1)''')
+                old.execute("INSERT INTO question_admin_log VALUES(4,'101',1,'disable',?)", (Clock()(),))
+                if version == 6:
+                    old.execute("INSERT INTO question_topics VALUES(25,'Пустая тема',3)")
                 old.commit()
-                before = old.execute('SELECT * FROM questions ORDER BY question_id').fetchall()
+                before = old.execute('SELECT * FROM questions').fetchone()
                 audit = old.execute('SELECT * FROM question_admin_log').fetchall()
             with closing(connect(path)) as current:
-                self.assertEqual(current.execute('PRAGMA user_version').fetchone()[0], 6)
-                self.assertEqual([tuple(row) for row in current.execute('SELECT * FROM questions ORDER BY question_id')], before)
-                self.assertEqual([tuple(row) for row in current.execute('SELECT * FROM question_admin_log')], audit)
-                self.assertEqual({row[0] for row in current.execute('SELECT name FROM question_topics')},
-                                 {question[2] for question in before})
+                self.assertEqual(current.execute('PRAGMA user_version').fetchone()[0], 7)
+                self.assertEqual(tuple(current.execute('SELECT * FROM questions').fetchone()), (*before, None))
+                self.assertEqual([tuple(row) for row in current.execute('SELECT * FROM question_admin_log')],
+                                 [(*audit[0], None)])
+                bank = QuestionBank(current)
+                self.assertIsNotNone(bank.topic_by_name('История'))
+                if version == 6:
+                    self.assertEqual(tuple(bank.topic_by_name('Пустая тема')), (25, 'Пустая тема', 3, None))
+                self.assertIsNone(current.execute('PRAGMA foreign_key_check').fetchone())
 
     def test_v4_upgrade_keeps_existing_records_and_allows_audit(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'v4.db'
-            schema = (ROOT/'quiz_bot_schema.sql').read_text(encoding='utf-8')
-            schema = schema.replace(' CHECK(is_active IN (0,1)),\n    revision INTEGER NOT NULL DEFAULT 0 CHECK(revision>=0)',
-                                    ' CHECK(is_active IN (0,1))')
-            schema = schema[:schema.index('CREATE TABLE IF NOT EXISTS question_admin_log')]+schema[schema.index('CREATE TABLE IF NOT EXISTS games'):]
-            schema = schema.replace('PRAGMA user_version = 6;', 'PRAGMA user_version = 4;')
             tables = ('users','questions','games','game_participants','game_questions','answers')
             with closing(sqlite3.connect(path)) as old:
-                old.executescript(schema)
+                old.executescript(self.legacy_schema(4))
                 old.row_factory = sqlite3.Row
                 defaults = json.loads((ROOT/'data'/'questions.json').read_text(encoding='utf-8'))[:5]
                 old.executemany('''INSERT INTO questions(source_key,topic,difficulty,question_text,options_json,correct_answer)
@@ -467,7 +600,7 @@ class AdminMigrationTests(unittest.TestCase):
                 old.commit()
                 before = {table: [tuple(row) for row in old.execute('SELECT * FROM '+table)] for table in tables}
             with closing(connect(path)) as current:
-                self.assertEqual(current.execute('PRAGMA user_version').fetchone()[0], 6)
+                self.assertEqual(current.execute('PRAGMA user_version').fetchone()[0], 7)
                 for table, rows in before.items():
                     saved_columns = 'question_id,source_key,topic,difficulty,question_text,options_json,correct_answer,explanation,is_active'
                     selection = saved_columns if table == 'questions' else '*'
