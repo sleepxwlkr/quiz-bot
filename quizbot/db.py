@@ -11,11 +11,10 @@ ROOT = Path(__file__).resolve().parent.parent
 def connect(path):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(str(path))
+    db = sqlite3.connect(str(path), timeout=5)
     db.row_factory = sqlite3.Row
     db.execute('PRAGMA foreign_keys=ON')
     db.execute('PRAGMA journal_mode=WAL')
-    db.execute('PRAGMA busy_timeout=5000')
     db.create_function('quiz_casefold', 1, str.casefold)
     version = db.execute('PRAGMA user_version').fetchone()[0]
     if version not in (0, 1, 2, 3, 4, 5, 6, 7):

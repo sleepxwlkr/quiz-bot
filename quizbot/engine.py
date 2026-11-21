@@ -11,6 +11,8 @@ import unicodedata
 DIFFICULTIES = {'easy': 'Лёгкая', 'medium': 'Средняя', 'hard': 'Сложная', 'mixed': 'Смешанная'}
 POINTS = {'easy': 10, 'medium': 15, 'hard': 20}
 CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'
+QUESTION_COUNTS = (5, 10, 20, 30)
+QUESTION_TIMES = (15, 30, 60, 120)
 
 
 def new_game_code():
@@ -53,6 +55,17 @@ def points_for(base, elapsed_ms, limit_ms, correct):
     return max(math.ceil(maximum/2),math.floor(maximum*(1-0.5*fraction)+0.5))
 
 
+def question_filter(topic, difficulty):
+    conditions, params = ['is_active=1'], []
+    if topic != 'Все темы':
+        conditions.append('topic=?')
+        params.append(topic)
+    if difficulty != 'mixed':
+        conditions.append('difficulty=?')
+        params.append(difficulty)
+    return ' FROM questions WHERE '+' AND '.join(conditions), params
+
+
 class Engine:
     def __init__(self, db, clock=time.time):
         self.db = db
@@ -72,6 +85,9 @@ class Engine:
         return json.loads(row[0]) if row else {}
 
     def set_state(self, platform_id, state):
+        if not state:
+            self.db.execute('DELETE FROM conversations WHERE platform_user_id=?', (str(platform_id),))
+            return
         self.db.execute('INSERT OR REPLACE INTO conversations VALUES(?,?)',
                         (str(platform_id), json.dumps(state, ensure_ascii=False)))
 
@@ -153,19 +169,22 @@ class Engine:
     def active(self, user_id):
         return self.one('''SELECT g.* FROM games g JOIN game_participants p USING(game_id)
             WHERE p.user_id=? AND g.status IN ('lobby','in_progress')
-            ORDER BY g.game_id DESC LIMIT 1''', (user_id,))
+            ORDER BY p.game_id DESC LIMIT 1''', (user_id,))
 
     def available_questions(self, topic, difficulty):
-        return self.all('''SELECT * FROM questions WHERE is_active=1
-            AND (?='Все темы' OR topic=?) AND (?='mixed' OR difficulty=?)''',
-                        (topic,topic,difficulty,difficulty))
+        clause, params = question_filter(topic,difficulty)
+        return self.all('SELECT *'+clause, params)
+
+    def available_question_count(self, topic, difficulty):
+        clause, params = question_filter(topic,difficulty)
+        return self.one('SELECT COUNT(*)'+clause, params)[0]
 
     def create(self, user_id, topic, difficulty, count, seconds):
         if self.active(user_id):
             raise RuleError('У вас уже есть игра. Откройте её через /room или выйдите с помощью /leave.')
-        if difficulty not in DIFFICULTIES or count not in (5,10,20,30) or seconds not in (15,30,60,120):
+        if difficulty not in DIFFICULTIES or count not in QUESTION_COUNTS or seconds not in QUESTION_TIMES:
             raise RuleError('Эти настройки недоступны. Выберите значения из кнопок в меню комнаты.')
-        if len(self.available_questions(topic,difficulty)) < count:
+        if self.available_question_count(topic,difficulty) < count:
             raise RuleError('Для этой темы и сложности мало вопросов. Выберите меньше вопросов или другую сложность.')
         now = self.clock()
         for _ in range(100):
@@ -274,8 +293,8 @@ class Engine:
                         (gid,uid,position,'answered',selected,correct,elapsed,score,now))
         self.db.execute('''UPDATE game_participants SET total_score=total_score+?,correct_count=correct_count+?,
             total_response_ms=total_response_ms+? WHERE game_id=? AND user_id=?''', (score,correct,elapsed,gid,uid))
-        self.open_question(gid,uid,position+1,now)
-        self.finalize(gid)
+        if self.open_question(gid,uid,position+1,now) is None:
+            self.finalize(gid)
 
     def tick(self):
         now = self.clock()
@@ -294,7 +313,8 @@ class Engine:
                 position += 1
                 # A delayed check must not extend the time allowed for the game.
                 deadline = self.open_question(gid,uid,position,deadline)
-            affected.add(gid)
+            if deadline is None:
+                affected.add(gid)
         for gid in affected:
             self.finalize(gid)
 

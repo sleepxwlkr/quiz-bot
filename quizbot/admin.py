@@ -112,7 +112,7 @@ class QuestionAdmin:
         elif action == 'new_topic' and screen == 'topics':
             state['topic_edit_id'] = None
             self.ask_topic_name(pid, state)
-        elif action == 'rename' and screen in ('rename_topics', 'difficulties'):
+        elif action == 'rename' and screen == 'rename_topics':
             topic = self.topic(int(value))
             state.update(topic_edit_id=topic['topic_id'], topic_edit_revision=topic['revision'],
                          topic_edit_name=topic['name'])
@@ -206,8 +206,8 @@ class QuestionAdmin:
         return {**state['filters'], 'topic': topic['name'], 'difficulty': state['difficulty']}
 
     def filter_summary(self, filters):
-        topic = shorten(filters.get('topic', 'Все темы'), 70, single_line=True)
-        difficulty = DIFFICULTIES.get(filters.get('difficulty'), 'Любая сложность')
+        topic = shorten(filters['topic'], 70, single_line=True)
+        difficulty = DIFFICULTIES[filters['difficulty']]
         active = {0: 'Отключённые', 1: 'Включённые'}.get(filters.get('active'), 'Любой статус')
         lines = [f'{html.escape(topic)} · {difficulty} · {active}']
         if filters.get('query'):
@@ -437,9 +437,6 @@ class QuestionAdmin:
     def parse_field(self, field, text):
         if field == 'text':
             validate_text(text)
-        elif field == 'topic':
-            if self.bank.topic_by_name(text) is None:
-                raise ValueError('Такой темы нет. Проверьте название или создайте тему в /admin.')
         elif field == 'options':
             options = [line.strip() for line in text.splitlines()]
             validate_options(options)
@@ -477,7 +474,11 @@ class QuestionAdmin:
         if field == 'options' and draft.get('options') != value:
             draft.pop('correct', None)
         if field == 'topic':
-            state['draft_topic_id'] = self.bank.topic_by_name(value)['topic_id']
+            topic = self.bank.topic_by_name(value)
+            if topic is None:
+                self.ask_field(pid, state, field, 'Такой темы нет. Проверьте название или создайте тему в /admin.')
+                return
+            state['draft_topic_id'] = topic['topic_id']
         draft[field] = value
         missing = next((key for key in FIELDS if key not in draft), None)
         if missing is None:

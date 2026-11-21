@@ -137,6 +137,7 @@ CREATE INDEX IF NOT EXISTS idx_deadlines ON game_participants(participant_status
 CREATE INDEX IF NOT EXISTS idx_questions_filter ON questions(topic,difficulty,is_active);
 CREATE INDEX IF NOT EXISTS idx_answers_user ON answers(user_id,game_id);
 CREATE INDEX IF NOT EXISTS idx_outbox_due ON outbox(available_at,outbox_id);
+CREATE INDEX IF NOT EXISTS idx_outbox_screen ON outbox(chat_id,slot) WHERE slot IS NOT NULL;
 CREATE TABLE IF NOT EXISTS ui_messages (
     chat_id TEXT NOT NULL,
     slot TEXT NOT NULL,

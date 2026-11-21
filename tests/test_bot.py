@@ -806,7 +806,7 @@ class BotTests(unittest.TestCase):
         self.e.join(self.b['user_id'],code)
         app=Application(self.e,'test_bot')
         for user,expected in ((self.a,'delete:%s'%gid),(self.b,'leave')):
-            app.lobby(user,gid)
+            app.lobby(gid,user['user_id'])
             payload=json.loads(self.e.one("SELECT payload_json FROM outbox WHERE chat_id=? AND slot='room'",
                                          (user['platform_user_id'],))[0])
             buttons=[button for row in payload['reply_markup']['inline_keyboard'] for button in row]

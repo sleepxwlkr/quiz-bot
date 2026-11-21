@@ -1,1 +1,0 @@
-# No third-party dependencies. Requires Python 3.9 or newer (sqlite3, urllib).

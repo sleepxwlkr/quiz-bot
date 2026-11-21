@@ -4,7 +4,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 
 from .admin import QuestionAdmin
-from .engine import DIFFICULTIES, RuleError, format_count, keyboard, mention
+from .engine import DIFFICULTIES, QUESTION_COUNTS, QUESTION_TIMES, RuleError, format_count, keyboard, mention
 
 LOCAL_TZ = timezone(timedelta(hours=5))
 
@@ -51,20 +51,17 @@ class Application:
             return ''
 
     def pending_response(self,pid):
-        return self.e.one("SELECT * FROM outbox WHERE chat_id=? AND slot='room' ORDER BY outbox_id DESC LIMIT 1",
+        return self.e.one("SELECT outbox_id,payload_json FROM outbox WHERE chat_id=? AND slot='room' ORDER BY outbox_id DESC LIMIT 1",
                           (str(pid),))
 
-    def present_response(self,pid,before,text,data,message_id):
+    def present_response(self,pid,before,message_id):
         response=self.pending_response(pid)
         if response is None or (before is not None and before['outbox_id']==response['outbox_id']):
             return
-        # Answers advance the existing game screen; every other button uses
-        # the message actually clicked. Text input moves the screen to the bottom.
-        if data.startswith('a:') or (not text and message_id is None):
-            return
-        current=self.e.one("SELECT message_id FROM ui_messages WHERE chat_id=? AND slot='room'",(str(pid),))
-        if message_id is not None and current and current[0]==message_id:
-            return
+        if message_id is not None:
+            current=self.e.one("SELECT message_id FROM ui_messages WHERE chat_id=? AND slot='room'",(str(pid),))
+            if current and current[0]==message_id:
+                return
         previous=self.e.retarget_panel(pid,message_id)
         payload=json.loads(response['payload_json'])
         payload['_panel_epoch']=self.e.panel_epoch(pid)
@@ -73,18 +70,22 @@ class Application:
         self.e.remove_old_panel(pid,previous)
 
     def show_error(self,pid,text,input_text):
-        before=self.pending_response(pid)
+        before=self.pending_response(pid) if input_text else None
         self.e.send(pid,text,menu() if self.e.user(pid) else None)
-        self.present_response(pid,before,input_text,'',None)
+        if input_text:
+            self.present_response(pid,before,None)
 
     def route(self, pid, text, data, received_at, message_id=None):
+        # Answers advance the existing game screen. Other buttons use the clicked screen.
+        if data.startswith('a:') or (not text and message_id is None):
+            return self._route(pid,text,data,received_at)
         before=self.pending_response(pid)
         try:
-            return self._route(pid,text,data,received_at,message_id)
+            return self._route(pid,text,data,received_at)
         finally:
-            self.present_response(pid,before,text,data,message_id)
+            self.present_response(pid,before,message_id)
 
-    def _route(self, pid, text, data, received_at, message_id=None):
+    def _route(self, pid, text, data, received_at):
         state = self.e.state(pid)
         parts = text.split(maxsplit=1)
         cmd = parts[0].split('@')[0].lower() if parts and parts[0].startswith('/') else ''
@@ -172,28 +173,28 @@ class Application:
                 raise RuleError('У вас пока нет активной игры. Создайте комнату или войдите по коду. '
                                 'Итоги прошлых игр можно посмотреть в /history.')
             self.e.set_state(pid,{})
-            self.lobby(u,g['game_id'])
+            self.lobby(g['game_id'],uid)
         elif data.startswith('start:'):
             self.e.start(int(data.split(':')[1]),uid)
         elif data.startswith('delete:'):
-            self.confirm_lobby_deletion(u,int(data.split(':')[1]),message_id)
+            self.confirm_lobby_deletion(u,int(data.split(':')[1]))
         elif data.startswith('delete_yes:'):
-            self.delete_lobby(u,int(data.split(':')[1]),message_id)
+            self.delete_lobby(u,int(data.split(':')[1]))
         elif cmd=='/leave' or data=='leave':
             g = self.e.active(uid)
             if not g:
                 raise RuleError('У вас нет активной игры.')
             if g['status']=='lobby' and g['created_by_user_id']==uid:
-                self.confirm_lobby_deletion(u,g['game_id'],message_id)
+                self.confirm_lobby_deletion(u,g['game_id'])
                 return ''
-            self.confirm_leave(u,g,message_id)
+            self.confirm_leave(u,g)
         elif data.startswith('leave_yes:'):
             confirmation=data.split(':')
             g = self.e.active(uid)
             if not g or g['game_id']!=int(confirmation[1]):
                 raise RuleError('Это подтверждение больше не действует. Откройте «Моя игра», чтобы увидеть текущую комнату.')
             if g['status']=='lobby' and g['created_by_user_id']==uid:
-                self.delete_lobby(u,g['game_id'],message_id)
+                self.delete_lobby(u,g['game_id'])
                 return ''
             if (len(confirmation)!=3 or state.get('step')!='confirm_leave'
                     or state.get('game_id')!=g['game_id'] or state.get('token')!=confirmation[2]):
@@ -201,15 +202,14 @@ class Application:
             if state['phase']=='lobby' and g['status']!='lobby':
                 # The owner may have started while the guest was deciding.
                 # Explain the consequences before accepting a surrender.
-                self.confirm_leave(u,g,message_id)
+                self.confirm_leave(u,g)
                 return ''
             self.e.leave(uid)
             self.e.set_state(pid,{})
             self.e.send(pid,('Вы покинули комнату.' if g['status']=='lobby' else 'Вы вышли из игры.')+
                         '\n\n<b>Главное меню</b>',menu(),slot='room')
             if g['status']=='lobby':
-                for participant in self.e.participants(g['game_id']):
-                    self.lobby(self.e.user(participant['platform_user_id']),g['game_id'])
+                self.lobby(g['game_id'])
         elif data.startswith('a:'):
             _,gid,pos,selected = data.split(':')
             self.e.answer(int(gid),uid,int(pos),int(selected),received_at)
@@ -227,7 +227,7 @@ class Application:
             self.e.send(pid,'<b>Главное меню</b>\nВыберите действие кнопкой ниже. Во время игры отвечайте кнопками под вопросом.',menu())
         return ''
 
-    def confirm_leave(self,u,g,message_id):
+    def confirm_leave(self,u,g):
         participant=self.e.one('SELECT participant_status FROM game_participants WHERE game_id=? AND user_id=?',
                                (g['game_id'],u['user_id']))
         if not participant or participant[0] not in ('joined','playing'):
@@ -242,13 +242,13 @@ class Application:
         self.e.send(u['platform_user_id'],text,
                     keyboard([('Да, выйти','leave_yes:%s:%s'%(g['game_id'],token)),('Отмена','room')]),slot='room')
 
-    def confirm_lobby_deletion(self,u,gid,message_id):
+    def confirm_lobby_deletion(self,u,gid):
         g=self.e.owned_lobby(gid,u['user_id'])
         self.e.send(u['platform_user_id'],'Удалить комнату <code>%s</code>?\n\n'
                     'Комната закроется для всех, и игра не начнётся.'%g['game_code'],
                     keyboard([('Да, удалить','delete_yes:%s'%gid),('Отмена','room')]),slot='room')
 
-    def delete_lobby(self,u,gid,message_id):
+    def delete_lobby(self,u,gid):
         self.e.delete_lobby(gid,u['user_id'])
         self.e.set_state(u['platform_user_id'],{})
         self.e.send(u['platform_user_id'],'Комната удалена.\n\n<b>Главное меню</b>',menu(),slot='room')
@@ -256,19 +256,19 @@ class Application:
     def join(self, u, code):
         gid = self.e.join(u['user_id'],code)
         self.e.set_state(u['platform_user_id'],{})
-        for p in self.e.participants(gid):
-            self.lobby(self.e.user(p['platform_user_id']),gid)
+        self.lobby(gid)
 
-    def wizard(self, pid, state):
+    def wizard(self, pid, state, available=None):
         token = state['token']
         def button(label,key,value):
             return label,'w:%s:%s:%s'%(token,key,value)
         topic = state['topics'][state['topic']]
         rows = [[button(t,'topic',i)] for i,t in enumerate(state['topics'])]
         rows.append([button(v,'difficulty',k) for k,v in DIFFICULTIES.items()])
-        count = len(self.e.available_questions(topic,state['difficulty']))
-        rows.append([button(str(n)+' вопр.','count',n) for n in (5,10,20,30) if n<=count])
-        rows.append([button(str(s)+' сек.','seconds',s) for s in (15,30,60,120)])
+        if available is None:
+            available = self.e.available_question_count(topic,state['difficulty'])
+        rows.append([button(str(n)+' вопр.','count',n) for n in QUESTION_COUNTS if n<=available])
+        rows.append([button(str(s)+' сек.','seconds',s) for s in QUESTION_TIMES])
         rows.append([button('Создать комнату','save','yes'),('Отмена','menu')])
         self.e.send(pid,'<b>Настройки комнаты</b>\n\nТема — %s\nСложность — %s\nВопросов — %s\nВремя на вопрос — %s с\n\n'
                     'Чтобы изменить настройку, выберите значение ниже. Когда всё готово, нажмите «Создать комнату».'%
@@ -281,32 +281,38 @@ class Application:
         if key=='save':
             gid = self.e.create(u['user_id'],state['topics'][state['topic']],state['difficulty'],state['count'],state['seconds'])
             self.e.set_state(u['platform_user_id'],{})
-            self.lobby(u,gid)
+            self.lobby(gid,u['user_id'])
             return
-        allowed = {'topic':range(len(state['topics'])),'difficulty':DIFFICULTIES,'count':(5,10,20,30),'seconds':(15,30,60,120)}
+        allowed = {'topic':range(len(state['topics'])),'difficulty':DIFFICULTIES,
+                   'count':QUESTION_COUNTS,'seconds':QUESTION_TIMES}
         if key not in allowed:
             raise RuleError('Не удалось распознать настройку. Используйте кнопки под текущими настройками.')
         value = value if key=='difficulty' else int(value)
         if value not in allowed[key]:
             raise RuleError('Этот вариант недоступен. Выберите другой из текущего меню.')
         state[key] = value
-        available = len(self.e.available_questions(state['topics'][state['topic']],state['difficulty']))
+        available = self.e.available_question_count(state['topics'][state['topic']],state['difficulty'])
         if state['count']>available:
-            choices = [n for n in (5,10,20,30) if n<=available]
+            choices = [n for n in QUESTION_COUNTS if n<=available]
             if not choices:
                 raise RuleError('Для этой темы и сложности меньше 5 вопросов. Выберите другую тему или сложность.')
             state['count']=max(choices)
         self.e.set_state(u['platform_user_id'],state)
-        self.wizard(u['platform_user_id'],state)
+        self.wizard(u['platform_user_id'],state,available)
 
-    def lobby(self,u,gid):
-        g = self.e.one('SELECT * FROM games WHERE game_id=?',(gid,))
+    def lobby(self,gid,user_id=None):
+        game = self.e.one('SELECT * FROM games WHERE game_id=?',(gid,))
         players = self.e.participants(gid)
-        if not any(p['user_id']==u['user_id'] for p in players):
+        recipients = players if user_id is None else [p for p in players if p['user_id']==user_id]
+        if not recipients:
             raise RuleError('Вы не участник этой игры.')
-        p = next(p for p in players if p['user_id']==u['user_id'])
+        for player in recipients:
+            self.show_lobby(game,players,player)
+
+    def show_lobby(self,g,players,p):
+        gid = g['game_id']
         if g['status']=='in_progress' and p['participant_status']=='playing':
-            self.e.send(u['platform_user_id'],'',kind='question',game_id=gid,user_id=u['user_id'],position=p['current_position'])
+            self.e.send(p['platform_user_id'],'',kind='question',game_id=gid,user_id=p['user_id'],position=p['current_position'])
             return
         lines = [f"<b>Комната {g['game_code']}</b>", f"Тема — {html.escape(g['topic'])}",
                  f"Сложность — {DIFFICULTIES[g['difficulty']]}",
@@ -325,7 +331,7 @@ class Application:
                           'Итоги появятся здесь, когда закончат остальные.'])
             rows = [[('Обновить','room'),('Меню','menu')]]
         if g['status']=='lobby':
-            if g['created_by_user_id']==u['user_id']:
+            if g['created_by_user_id']==p['user_id']:
                 rows = [[('Обновить','room'),('Удалить','delete:%s'%gid)]]
                 next_step = ('Поделитесь ссылкой или кодом. Для старта нужны хотя бы два игрока.' if len(players)<2
                              else 'Когда все соберутся, нажмите «Начать игру».')
@@ -334,7 +340,7 @@ class Application:
                 next_step = 'Игру запустит создатель комнаты.'
             lines.extend(['',next_step,'','<b>Как пригласить</b>',f"Код комнаты — <code>{g['game_code']}</code>",
                           'https://t.me/%s?start=join_%s'%(self.bot_username,g['game_code'])])
-        self.e.send(u['platform_user_id'],'\n'.join(lines),keyboard(*rows),slot='room')
+        self.e.send(p['platform_user_id'],'\n'.join(lines),keyboard(*rows),slot='room')
 
     def show_leaderboard(self,pid):
         now = datetime.fromtimestamp(self.e.clock(), LOCAL_TZ)
@@ -358,7 +364,7 @@ class Application:
         page=max(0,page)
         records = self.e.all('''SELECT g.game_code,g.created_at,g.status,p.total_score,p.rank
             FROM games g JOIN game_participants p USING(game_id)
-            WHERE p.user_id=? ORDER BY g.game_id DESC LIMIT 6 OFFSET ?''',(u['user_id'],page*5))
+            WHERE p.user_id=? ORDER BY p.game_id DESC LIMIT 6 OFFSET ?''',(u['user_id'],page*5))
         lines = [f'<b>История игр · страница {page+1}</b>', '']
         for g in records[:5]:
             date = datetime.fromtimestamp(g['created_at'],LOCAL_TZ).strftime('%d.%m.%Y')

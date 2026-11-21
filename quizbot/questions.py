@@ -62,13 +62,13 @@ class QuestionBank:
             params.append(filters['query'].casefold())
         where = ' WHERE ' + ' AND '.join(conditions)
         return self.db.execute(
-            'SELECT * FROM questions'+where+' ORDER BY question_id DESC LIMIT ? OFFSET ?',
+            'SELECT question_id,question_text,is_active FROM questions'+where+' ORDER BY question_id DESC LIMIT ? OFFSET ?',
             (*params, limit, offset),
         ).fetchall()
 
     def topics(self, limit, offset):
         return self.db.execute(
-            'SELECT * FROM question_topics WHERE deleted_at IS NULL ORDER BY quiz_casefold(name),name LIMIT ? OFFSET ?',
+            'SELECT topic_id,name FROM question_topics WHERE deleted_at IS NULL ORDER BY quiz_casefold(name),name LIMIT ? OFFSET ?',
             (limit, offset),
         ).fetchall()
 
@@ -167,5 +167,5 @@ class QuestionBank:
             VALUES(?,?,?,?)''', (actor_id, question_id, action, occurred_at))
 
     def log_page(self, limit, offset):
-        return self.db.execute('''SELECT log_id,actor_telegram_id,question_id,action,occurred_at,topic_name
+        return self.db.execute('''SELECT actor_telegram_id,question_id,action,occurred_at,topic_name
             FROM question_admin_log ORDER BY log_id DESC LIMIT ? OFFSET ?''', (limit, offset)).fetchall()

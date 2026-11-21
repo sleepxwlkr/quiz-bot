@@ -16,6 +16,7 @@ from .engine import Engine
 from .telegram import TelegramClient, TelegramError
 
 log = logging.getLogger('quizbot')
+SEND_WORKERS = 4
 
 
 def load_env():
@@ -68,7 +69,7 @@ class Runner:
         self.offset_key='update_offset:%s'%bot_id
         self.last_send={}
         self.api_available_at=0
-        self.executor=ThreadPoolExecutor(max_workers=4,thread_name_prefix='telegram-send')
+        self.executor=ThreadPoolExecutor(max_workers=SEND_WORKERS,thread_name_prefix='telegram-send')
         self.in_flight={}
         self.acknowledgements=set()
 
@@ -161,30 +162,31 @@ class Runner:
                 raise
         return result,self.engine.clock()
 
-    def deliver(self,limit=10):
+    def deliver(self):
         self.collect_deliveries()
         self.tick()
         now=time.time()
-        if now<self.api_available_at:
+        if now<self.api_available_at or len(self.in_flight)>=SEND_WORKERS:
             return
         busy={row['chat_id'] for row,_ in self.in_flight.values()}
         rows=self.engine.all("SELECT * FROM outbox WHERE available_at<=? ORDER BY (kind='api'),outbox_id LIMIT 100",(now,))
-        dispatched=0
         for row in rows:
-            if dispatched>=limit or len(self.in_flight)>=4:
+            if len(self.in_flight)>=SEND_WORKERS:
                 break
             if row['chat_id'] in busy or now-self.last_send.get(row['chat_id'],0)<1.05:
                 continue
-            if row['slot'] and json.loads(row['payload_json']).get('_panel_epoch',0)!=self.engine.panel_epoch(row['chat_id']):
+            payload=json.loads(row['payload_json'])
+            epoch=payload.pop('_panel_epoch',0)
+            if row['slot'] and epoch!=self.engine.panel_epoch(row['chat_id']):
                 with self.db:
                     self.db.execute('DELETE FROM outbox WHERE outbox_id=?',(row['outbox_id'],))
                 continue
-            payload=self.engine.question_payload(row) if row['kind']=='question' else json.loads(row['payload_json'])
-            if payload is None:
-                with self.db:
-                    self.db.execute('DELETE FROM outbox WHERE outbox_id=?',(row['outbox_id'],))
-                continue
-            payload.pop('_panel_epoch',None)
+            if row['kind']=='question':
+                payload=self.engine.question_payload(row)
+                if payload is None:
+                    with self.db:
+                        self.db.execute('DELETE FROM outbox WHERE outbox_id=?',(row['outbox_id'],))
+                    continue
             params={'chat_id':row['chat_id'],**payload}
             target=self.engine.one('SELECT message_id FROM ui_messages WHERE chat_id=? AND slot=?',
                                    (row['chat_id'],row['slot'])) if row['slot'] else None
@@ -206,7 +208,6 @@ class Runner:
             future=self.executor.submit(self._send_message,method,params)
             self.in_flight[future]=(row,time.perf_counter())
             busy.add(row['chat_id'])
-            dispatched+=1
 
     def _poll(self,events,stop,offset):
         """Fetch immediately on arrival; confirm a batch only after DB commits."""

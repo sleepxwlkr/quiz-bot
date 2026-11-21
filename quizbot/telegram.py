@@ -85,7 +85,7 @@ class TelegramClient:
             self._discard_connection(polling=method=='getUpdates')
         try:
             return json.loads(body)
-        except (ValueError,UnicodeError):
+        except ValueError:
             raise TelegramError(response.status,'Invalid API response') from None
 
     def _request_via_urllib(self, method, params, timeout):
@@ -97,7 +97,7 @@ class TelegramClient:
         except urllib.error.HTTPError as exc:
             try:
                 return json.loads(exc.read().decode('utf-8'))
-            except (ValueError,UnicodeError):
+            except ValueError:
                 raise TelegramError(exc.code,'HTTP request failed') from None
 
     def call(self, method, **params):
