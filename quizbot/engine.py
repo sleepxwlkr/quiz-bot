@@ -9,7 +9,6 @@ import time
 import unicodedata
 
 DIFFICULTIES = {'easy': 'Лёгкая', 'medium': 'Средняя', 'hard': 'Сложная', 'mixed': 'Смешанная'}
-MODES = {'room': 'Комната', 'duel': 'Дуэль'}
 POINTS = {'easy': 10, 'medium': 15, 'hard': 20}
 CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'
 
@@ -156,23 +155,21 @@ class Engine:
             AND (?='Все темы' OR topic=?) AND (?='mixed' OR difficulty=?)''',
                         (topic,topic,difficulty,difficulty))
 
-    def create(self, user_id, mode, topic, difficulty, count, seconds, matchmaking='public'):
+    def create(self, user_id, topic, difficulty, count, seconds):
         if self.active(user_id):
             raise RuleError('Вы уже участвуете в игре. Откройте /room или выйдите через /leave.')
-        if mode not in MODES or difficulty not in DIFFICULTIES or count not in (5,10,20,30) or seconds not in (15,30,60,120):
+        if difficulty not in DIFFICULTIES or count not in (5,10,20,30) or seconds not in (15,30,60,120):
             raise RuleError('Недопустимые настройки игры.')
-        if mode=='duel' and matchmaking not in ('public','invite'):
-            raise RuleError('Выберите поиск соперника или приглашение друга.')
         if len(self.available_questions(topic,difficulty)) < count:
             raise RuleError('Для этих настроек недостаточно вопросов. Уменьшите их число или выберите смешанную сложность.')
         now = self.clock()
         for _ in range(100):
             code = new_game_code()
             try:
-                cur = self.db.execute('''INSERT INTO games(game_code,mode,matchmaking,created_by_user_id,topic,difficulty,
+                cur = self.db.execute('''INSERT INTO games(game_code,created_by_user_id,topic,difficulty,
                     question_count,question_time_limit_seconds,created_at,lobby_expires_at,scoring_version)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,2)''',
-                    (code,mode,matchmaking if mode=='duel' else 'none',user_id,topic,difficulty,count,seconds,now,now+1800))
+                    VALUES(?,?,?,?,?,?,?,?,2)''',
+                    (code,user_id,topic,difficulty,count,seconds,now,now+1800))
                 break
             except sqlite3.IntegrityError as exc:
                 if 'games.game_code' not in str(exc):
@@ -181,9 +178,6 @@ class Engine:
             raise RuleError('Не удалось подобрать свободный код. Попробуйте ещё раз.')
         self.join(user_id, code)
         return cur.lastrowid
-
-    def challenge(self, user_id):
-        return self.create(user_id,'duel','Все темы','mixed',10,60,matchmaking='invite')
 
     def join(self, user_id, code):
         game = self.one('SELECT * FROM games WHERE game_code=?', (code.strip().upper(),))
@@ -194,29 +188,15 @@ class Engine:
         if self.active(user_id):
             raise RuleError('Сначала завершите текущую игру или выйдите через /leave.')
         size = self.one('SELECT COUNT(*) FROM game_participants WHERE game_id=?', (game['game_id'],))[0]
-        if size >= (2 if game['mode']=='duel' else 10):
+        if size >= 10:
             raise RuleError('В комнате больше нет свободных мест.')
         u = self.one('SELECT * FROM users WHERE user_id=?', (user_id,))
         self.db.execute('INSERT INTO game_participants(game_id,user_id,nickname_at_game,joined_at) VALUES(?,?,?,?)',
                         (game['game_id'],user_id,u['nickname'],self.clock()))
         return game['game_id']
 
-    def find_duel(self, user_id):
-        if self.active(user_id):
-            raise RuleError('Вы уже участвуете в игре. Откройте /room.')
-        u = self.one('SELECT rating FROM users WHERE user_id=?', (user_id,))
-        match = self.one('''SELECT g.* FROM games g JOIN users u ON u.user_id=g.created_by_user_id
-            WHERE g.mode='duel' AND g.matchmaking='public' AND g.status='lobby' AND g.lobby_expires_at>?
-            AND (SELECT COUNT(*) FROM game_participants p WHERE p.game_id=g.game_id)=1
-            ORDER BY ABS(u.rating-?),g.created_at LIMIT 1''', (self.clock(),u['rating']))
-        if match:
-            gid = self.join(user_id,match['game_code'])
-            self.start(gid,match['created_by_user_id'])
-            return gid, True
-        return self.create(user_id,'duel','Все темы','mixed',10,60), False
-
     def participants(self, gid):
-        return self.all('''SELECT p.*,u.platform_user_id,u.nickname,u.rating FROM game_participants p
+        return self.all('''SELECT p.*,u.platform_user_id,u.nickname FROM game_participants p
             JOIN users u USING(user_id) WHERE game_id=? ORDER BY p.rank,p.joined_at,p.user_id''', (gid,))
 
     def start(self, gid, owner_id):
@@ -243,8 +223,8 @@ class Engine:
         self.db.execute("UPDATE games SET status='in_progress',started_at=?,hard_deadline_at=? WHERE game_id=?",
                         (now,now+g['question_count']*g['question_time_limit_seconds'],gid))
         for p in players:
-            self.db.execute('''UPDATE game_participants SET nickname_at_game=?,participant_status='playing',
-                rating_before=? WHERE game_id=? AND user_id=?''', (p['nickname'],p['rating'],gid,p['user_id']))
+            self.db.execute('''UPDATE game_participants SET nickname_at_game=?,participant_status='playing'
+                WHERE game_id=? AND user_id=?''', (p['nickname'],gid,p['user_id']))
             self.open_question(gid,p['user_id'],1,now)
 
     def open_question(self, gid, uid, position, opened_at):
@@ -333,15 +313,6 @@ class Engine:
                 rank=index
             self.db.execute('UPDATE game_participants SET rank=? WHERE game_id=? AND user_id=?', (rank,gid,p['user_id']))
             previous=key(p)
-        if g['mode']=='duel':
-            a,b = self.participants(gid)
-            expected = 1/(1+10**((b['rating_before']-a['rating_before'])/400))
-            actual = 1 if a['rank']<b['rank'] else (0 if a['rank']>b['rank'] else 0.5)
-            delta = round(32*(actual-expected))
-            for p,change in ((a,delta),(b,-delta)):
-                self.db.execute('UPDATE users SET rating=rating+? WHERE user_id=?', (change,p['user_id']))
-                self.db.execute('UPDATE game_participants SET rating_change=?,rating_after=? WHERE game_id=? AND user_id=?',
-                                (change,p['rating_before']+change,gid,p['user_id']))
         self.db.execute("UPDATE games SET status='completed',finished_at=? WHERE game_id=?", (self.clock(),gid))
         result = self.results(gid)
         for p in players:
@@ -362,7 +333,7 @@ class Engine:
     def cancel(self, gid, reason):
         self.db.execute("UPDATE games SET status='cancelled',finished_at=? WHERE game_id=? AND status='lobby'", (self.clock(),gid))
         for p in self.participants(gid):
-            self.send(p['platform_user_id'],html.escape(reason)+'\nИгра отменена; статистика и рейтинг не меняются.',slot='room')
+            self.send(p['platform_user_id'],html.escape(reason)+'\nИгра отменена.',slot='room')
 
     def leave(self, uid):
         g = self.active(uid)
@@ -386,20 +357,35 @@ class Engine:
 
     def results(self, gid):
         g = self.one('SELECT * FROM games WHERE game_id=?', (gid,))
-        lines = ['🏆 <b>Итоги: %s</b>' % MODES[g['mode']],'<code>%s</code>' % g['game_code'],
+        lines = ['🏆 <b>Итоги: рейтинг игры</b>','<code>%s</code>' % g['game_code'],
                  '%s · %s вопросов' % (html.escape(g['topic']),g['question_count']),'']
         for p in self.participants(gid):
             label = mention(p['platform_user_id'],p['nickname_at_game'])
             line = '%s. %s — %s очк. (%s/%s)' % (p['rank'],label,p['total_score'],p['correct_count'],g['question_count'])
             if p['participant_status']=='forfeited':
                 line += ' · вышел'
-            if p['rating_change'] is not None:
-                line += '\nРейтинг: %s → %s (%+d)' % (p['rating_before'],p['rating_after'],p['rating_change'])
             lines.append(line)
         return '\n'.join(lines)
 
+    def leaderboard(self, start_at, end_at):
+        return self.all('''
+            WITH scores AS (
+                SELECT p.user_id, SUM(4 - p.rank) AS points
+                FROM games g JOIN game_participants p USING (game_id)
+                WHERE g.status='completed' AND g.finished_at>=? AND g.finished_at<?
+                  AND p.participant_status='finished' AND p.correct_count>0
+                  AND p.rank BETWEEN 1 AND 3
+                GROUP BY p.user_id
+            )
+            SELECT u.nickname, scores.points,
+                   RANK() OVER (ORDER BY scores.points DESC) AS place
+            FROM scores JOIN users u USING (user_id)
+            ORDER BY scores.points DESC, u.nickname_normalized
+            LIMIT 20
+        ''', (start_at, end_at))
+
     def question_payload(self, row):
-        p = self.one('''SELECT p.*,g.status,g.question_count,g.scoring_version,g.game_code,g.mode FROM game_participants p
+        p = self.one('''SELECT p.*,g.status,g.question_count,g.scoring_version,g.game_code FROM game_participants p
             JOIN games g USING(game_id) WHERE p.game_id=? AND p.user_id=?''', (row['game_id'],row['user_id']))
         if not p or p['status']!='in_progress' or p['participant_status']!='playing' or p['current_position']!=row['position']:
             return None
@@ -416,7 +402,7 @@ class Engine:
             timeout_note='⏰ Предыдущий вопрос пропущен: время вышло.\n\n'
         scoring_note = ('Первые 10 секунд — без штрафа за время.' if p['scoring_version']>=2
                         else 'Бонус за скорость — до 5 очков.')
-        return {'text':timeout_note+'%s · <code>%s</code>\n<b>Вопрос %s/%s</b> · %s · до %s очк.\nОсталось: %s сек.\n%s\n\n%s'%
-                (MODES[p['mode']],p['game_code'],p['current_position'],p['question_count'],DIFFICULTIES[q['difficulty_snapshot']],q['base_points']+5,
+        return {'text':timeout_note+'Комната · <code>%s</code>\n<b>Вопрос %s/%s</b> · %s · до %s очк.\nОсталось: %s сек.\n%s\n\n%s'%
+                (p['game_code'],p['current_position'],p['question_count'],DIFFICULTIES[q['difficulty_snapshot']],q['base_points']+5,
                  remaining,scoring_note,html.escape(q['question_snapshot'])),
                 'parse_mode':'HTML','reply_markup':keyboard(*rows)}

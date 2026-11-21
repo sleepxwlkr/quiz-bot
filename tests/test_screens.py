@@ -2,10 +2,11 @@ import json
 import tempfile
 import unittest
 from concurrent.futures import wait
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
-from quizbot.app import Application
+from quizbot.app import Application, LOCAL_TZ
 from quizbot.db import connect, seed_questions
 from quizbot.engine import Engine
 from quizbot.__main__ import Runner
@@ -89,7 +90,7 @@ class ScreenTests(unittest.TestCase):
         return self.client.messages[(str(pid),self.current_id(pid))]
 
     def complete_game(self):
-        gid=self.e.create(self.a['user_id'],'room','Все темы','mixed',5,60)
+        gid=self.e.create(self.a['user_id'],'Все темы','mixed',5,60)
         code=self.e.one('SELECT game_code FROM games WHERE game_id=?',(gid,))[0]
         self.e.join(self.b['user_id'],code)
         self.e.start(gid,self.a['user_id'])
@@ -101,9 +102,9 @@ class ScreenTests(unittest.TestCase):
         self.request(text='/start')
         message_id=self.current_id()
         screens=[
-            ('profile','Профиль'),('history:0','История игр'),('top','Рейтинг дуэлей'),
+            ('profile','Профиль'),('history:0','История игр'),('top','Общий рейтинг'),
             ('help','Квиз-бот'),('nick','Введите новый ник'),('menu','Выберите действие'),
-            ('join','Введите код'),('menu','Выберите действие'),('duel','Дуэли'),
+            ('join','Введите код'),('menu','Выберите действие'),
             ('menu','Выберите действие'),('create','Настройки комнаты'),
         ]
         for data,expected in screens:
@@ -116,6 +117,46 @@ class ScreenTests(unittest.TestCase):
         self.request(data='menu')
         self.assertEqual(sum(method=='sendMessage' for method,_ in self.client.calls),1)
         self.assertTrue(all('_panel_epoch' not in params for _,params in self.client.calls))
+
+    def test_monthly_leaderboard_uses_finished_games_and_shares_places(self):
+        carol=self.e.register(303,'Вера')['user_id']
+        dan=self.e.register(404,'Данил')['user_id']
+        alice,bob=self.a['user_id'],self.b['user_id']
+
+        def record_game(day, results):
+            self.clock.now=day.timestamp()
+            gid=self.e.create(alice,'Все темы','mixed',5,60)
+            game=self.e.active(alice)
+            for uid, _, _ in results[1:]:
+                self.e.join(uid,game['game_code'])
+            self.e.start(gid,alice)
+            for uid, correct, status in results:
+                self.db.execute('''UPDATE game_participants SET correct_count=?,total_score=?,participant_status=?
+                    WHERE game_id=? AND user_id=?''', (correct,correct*10,status,gid,uid))
+            self.e.finalize(gid)
+
+        won_by_bob=[(alice,1,'finished'),(bob,3,'finished')]
+        record_game(datetime(2026,11,30,23,59,59,tzinfo=LOCAL_TZ),won_by_bob)
+        record_game(datetime(2026,12,1,tzinfo=LOCAL_TZ),
+                    [(alice,4,'finished'),(bob,3,'finished'),(carol,2,'finished'),(dan,1,'finished')])
+        record_game(datetime(2026,12,2,tzinfo=LOCAL_TZ),won_by_bob)
+        record_game(datetime(2026,12,3,tzinfo=LOCAL_TZ),
+                    [(alice,3,'forfeited'),(dan,0,'finished')])
+        record_game(datetime(2027,1,1,tzinfo=LOCAL_TZ),won_by_bob)
+        self.clock.now=datetime(2026,12,31,12,tzinfo=LOCAL_TZ).timestamp()
+        self.request(text='/start')
+        message_id=self.current_id()
+        december=self.request(data='top')['text']
+        self.assertEqual(self.current_id(),message_id)
+        self.assertIn('12.2026',december)
+        self.assertIn('\n1. Алиса — 5\n1. Борис — 5\n3. Вера — 1\n',december)
+        self.assertNotIn('Данил',december)
+
+        self.clock.now=datetime(2027,1,1,tzinfo=LOCAL_TZ).timestamp()
+        january=self.request(text='/top')['text']
+        self.assertIn('01.2027',january)
+        self.assertIn('\n1. Борис — 3\n2. Алиса — 2\n',january)
+        self.assertNotIn('Вера',january)
 
     def test_history_pagination_results_and_reviews_share_one_screen(self):
         games=[self.complete_game() for _ in range(6)]
@@ -148,7 +189,7 @@ class ScreenTests(unittest.TestCase):
     def test_text_commands_replace_and_remove_previous_bot_screen(self):
         self.request(text='/start')
         old=self.current_id()
-        for command,title in [('/profile','Профиль'),('/history','История игр'),('/help','Квиз-бот'),('/top','Рейтинг дуэлей')]:
+        for command,title in [('/profile','Профиль'),('/history','История игр'),('/help','Квиз-бот'),('/menu','Выберите действие')]:
             self.assertIn(title,self.request(text=command)['text'])
             self.assertNotEqual(old,self.current_id())
             self.assertNotIn(('101',old),self.client.messages)
@@ -163,7 +204,7 @@ class ScreenTests(unittest.TestCase):
         self.assertEqual(len(self.client.messages),1)
 
     def test_profile_and_back_to_game_keep_question_time(self):
-        gid=self.e.create(self.a['user_id'],'room','Все темы','mixed',5,60)
+        gid=self.e.create(self.a['user_id'],'Все темы','mixed',5,60)
         code=self.e.one('SELECT game_code FROM games WHERE game_id=?',(gid,))[0]
         self.e.join(self.b['user_id'],code)
         self.e.start(gid,self.a['user_id'])
@@ -197,9 +238,9 @@ class ScreenTests(unittest.TestCase):
     def test_fast_navigation_queues_only_latest_screen(self):
         self.request(text='/start')
         message_id=self.current_id()
-        for data in ('profile','history:0','help','top'):
+        for data in ('profile','history:0','help','menu'):
             self.runner.app.route('101','',data,self.clock(),message_id)
         self.assertEqual(self.e.one("SELECT COUNT(*) FROM outbox WHERE chat_id='101' AND slot='room'")[0],1)
         self.flush()
-        self.assertIn('Рейтинг дуэлей',self.current()['text'])
+        self.assertIn('Выберите действие',self.current()['text'])
         self.assertEqual(self.current_id(),message_id)

@@ -69,8 +69,8 @@ class BotTests(unittest.TestCase):
             if user is None or row['user_id']==user['user_id']:
                 self.e.confirm_delivery(row,100+row['user_id'],self.clock())
 
-    def game(self,mode='room',count=5,seconds=60):
-        gid=self.e.create(self.a['user_id'],mode,'Все темы','mixed',count,seconds)
+    def game(self,count=5,seconds=60):
+        gid=self.e.create(self.a['user_id'],'Все темы','mixed',count,seconds)
         code=self.e.one('SELECT game_code FROM games WHERE game_id=?',(gid,))[0]
         self.e.join(self.b['user_id'],code)
         self.e.start(gid,self.a['user_id'])
@@ -100,7 +100,7 @@ class BotTests(unittest.TestCase):
         self.assertEqual(len(self.e.available_questions('География','easy')),10)
 
     def test_owner_and_lobby_capacity(self):
-        gid=self.e.create(self.a['user_id'],'room','Все темы','mixed',10,60)
+        gid=self.e.create(self.a['user_id'],'Все темы','mixed',10,60)
         code=self.e.one('SELECT game_code FROM games WHERE game_id=?',(gid,))[0]
         with self.assertRaises(RuleError):
             self.e.start(gid,self.b['user_id'])
@@ -173,7 +173,7 @@ class BotTests(unittest.TestCase):
         self.assertEqual(self.e.one('SELECT status FROM games WHERE game_id=?',(gid,))[0],'completed')
         self.assertEqual(self.e.one('SELECT COUNT(*) FROM answers')[0],20)
         self.assertEqual([p['rank'] for p in self.e.participants(gid)],[1,1])
-        self.assertEqual(self.e.one('SELECT games_played FROM user_overall_stats WHERE user_id=?',(self.a['user_id'],))[0],1)
+        self.assertEqual(self.e.one("SELECT COUNT(*) FROM games WHERE status='completed'")[0],1)
 
     def test_fast_players_finish_before_global_deadline(self):
         gid=self.game()
@@ -182,40 +182,25 @@ class BotTests(unittest.TestCase):
         self.answer_all(gid,self.b,False)
         self.assertEqual(self.e.one('SELECT status FROM games')[0],'completed')
         self.assertEqual(self.e.participants(gid)[0]['user_id'],self.a['user_id'])
-        self.assertEqual(self.e.user(101)['rating'],1000)
 
-    def test_duel_match_and_elo_exactly_once(self):
-        gid,started=self.e.find_duel(self.a['user_id'])
-        self.assertFalse(started)
-        other,started=self.e.find_duel(self.b['user_id'])
-        self.assertEqual(gid,other)
-        self.assertTrue(started)
-        self.answer_all(gid,self.a)
-        self.answer_all(gid,self.b,False)
-        self.e.finalize(gid)
-        self.assertEqual(self.e.user(101)['rating'],1016)
-        self.assertEqual(self.e.user(202)['rating'],984)
-        self.assertEqual(self.e.one('SELECT SUM(rating_change) FROM game_participants')[0],0)
 
     def test_forfeit_fills_remaining_and_loses(self):
-        gid=self.game(mode='duel')
+        gid=self.game()
         self.e.leave(self.a['user_id'])
         with self.assertRaises(RuleError):
-            self.e.find_duel(self.a['user_id'])
+            self.e.create(self.a['user_id'],'Все темы','mixed',5,60)
         self.clock.advance(300)
         self.e.tick()
         results=self.e.participants(gid)
         self.assertEqual(results[0]['user_id'],self.b['user_id'])
         self.assertEqual(self.e.one("SELECT COUNT(*) FROM answers WHERE answer_status='forfeited'")[0],5)
-        self.assertEqual(self.e.user(101)['rating'],984)
         self.assertFalse(self.e.active(self.a['user_id']))
 
-    def test_lobby_cancel_excluded_from_stats(self):
-        gid=self.e.create(self.a['user_id'],'room','Все темы','mixed',5,60)
+    def test_lobby_cancel_does_not_complete_game(self):
+        gid=self.e.create(self.a['user_id'],'Все темы','mixed',5,60)
         self.clock.advance(1800)
         self.e.tick()
         self.assertEqual(self.e.one('SELECT status FROM games WHERE game_id=?',(gid,))[0],'cancelled')
-        self.assertIsNone(self.e.one('SELECT * FROM user_overall_stats'))
 
     def test_rename_keeps_historical_nickname(self):
         gid=self.game()
@@ -227,17 +212,6 @@ class BotTests(unittest.TestCase):
         self.assertIn('Алиса',result)
         self.assertNotIn('Новое имя',result)
 
-    def test_stats_ignore_timeout_response_times(self):
-        gid=self.game()
-        q=self.e.one('SELECT * FROM game_questions WHERE game_id=? AND position=1',(gid,))
-        self.clock.advance(2)
-        self.e.answer(gid,self.a['user_id'],1,q['correct_answer_snapshot'])
-        self.clock.advance(300)
-        self.e.tick()
-        stats=self.e.one('SELECT * FROM user_mode_stats WHERE user_id=?',(self.a['user_id'],))
-        self.assertEqual(stats['accuracy_percent'],20)
-        self.assertEqual(stats['average_response_ms'],2000)
-        self.assertEqual(stats['total_questions'],5)
 
     def test_review_access_and_hidden_correct_answer(self):
         gid=self.game()
@@ -254,7 +228,7 @@ class BotTests(unittest.TestCase):
         self.assertIn('Верный ответ:',message['text'])
 
     def test_new_player_invite_survives_registration(self):
-        gid=self.e.create(self.a['user_id'],'room','Все темы','mixed',5,60)
+        gid=self.e.create(self.a['user_id'],'Все темы','mixed',5,60)
         code=self.e.one('SELECT game_code FROM games WHERE game_id=?',(gid,))[0]
         app=Application(self.e,'test_bot')
         app.handle({'message':{'from':{'id':303},'chat':{'id':303,'type':'private'},'text':'/start join_'+code}})
@@ -360,7 +334,7 @@ class BotTests(unittest.TestCase):
         event(101,data='history:0')
         event(101,text='/game '+game['game_code'])
         event(101,data='review:%s:1'%game['game_id'])
-        self.assertTrue(any('Средние очки:' in p['text'] for p in payloads))
+        self.assertTrue(any('Ваш ник:' in p['text'] for p in payloads))
         self.assertTrue(any('История игр' in p['text'] for p in payloads))
         self.assertTrue(any('Верный ответ:' in p['text'] for p in payloads))
         self.assertTrue(all(len(p['text'])<=4096 for p in payloads))
@@ -450,7 +424,7 @@ class BotTests(unittest.TestCase):
         self.assertEqual(points_for(15,35000,60000,True),15)
 
     def test_penalty_starts_at_delivery_not_queue_and_resend_cannot_reset_it(self):
-        gid=self.e.create(self.a['user_id'],'room','Все темы','mixed',5,60)
+        gid=self.e.create(self.a['user_id'],'Все темы','mixed',5,60)
         code=self.e.one('SELECT game_code FROM games WHERE game_id=?',(gid,))[0]
         self.e.join(self.b['user_id'],code)
         self.e.start(gid,self.a['user_id'])
@@ -526,29 +500,6 @@ class BotTests(unittest.TestCase):
         flush()
         self.assertIn('Итоги:',[p for _,p in client.calls if p.get('chat_id')=='101'][-1]['text'])
 
-    def test_database_migration_preserves_existing_history(self):
-        schema=(ROOT/'quiz_bot_schema.sql').read_text(encoding='utf-8')
-        schema=schema.replace('    question_delivered_at REAL,\n','').replace('    slot TEXT,\n','')
-        schema=schema.replace("    matchmaking TEXT NOT NULL DEFAULT 'none' CHECK(matchmaking IN ('none','public','invite')),\n",'')
-        schema=schema.replace('PRAGMA user_version = 3;','PRAGMA user_version = 1;')
-        path=Path(self.tmp.name)/'legacy.db'
-        old=sqlite3.connect(path)
-        old.executescript(schema)
-        old.execute("INSERT INTO users VALUES(1,'777','Legacy','legacy',1050,0,0)")
-        old.execute("INSERT INTO games(game_id,game_code,mode,created_by_user_id,topic,difficulty,question_count,question_time_limit_seconds,created_at,lobby_expires_at,scoring_version) VALUES(1,'OLD','room',1,'Все темы','mixed',5,60,0,1800,1)")
-        old.execute("INSERT INTO game_participants(game_id,user_id,nickname_at_game,joined_at) VALUES(1,1,'Legacy',0)")
-        old.commit()
-        old.close()
-        migrated=connect(path)
-        try:
-            self.assertEqual(migrated.execute('PRAGMA user_version').fetchone()[0],3)
-            self.assertEqual(migrated.execute('SELECT nickname FROM users').fetchone()[0],'Legacy')
-            self.assertEqual(migrated.execute('SELECT scoring_version FROM games').fetchone()[0],1)
-            self.assertIsNone(migrated.execute('SELECT question_delivered_at FROM game_participants').fetchone()[0])
-            self.assertIn('slot',[r[1] for r in migrated.execute('PRAGMA table_info(outbox)')])
-            self.assertEqual(migrated.execute('SELECT matchmaking FROM games').fetchone()[0],'none')
-        finally:
-            migrated.close()
 
     def test_five_character_codes_and_collision_retry(self):
         for _ in range(50):
@@ -556,127 +507,21 @@ class BotTests(unittest.TestCase):
             self.assertEqual(len(code),5)
             self.assertTrue(set(code)<=set(CODE_ALPHABET))
         with patch('quizbot.engine.new_game_code',return_value='S23J8'):
-            first=self.e.create(self.a['user_id'],'room','Все темы','mixed',5,60)
+            first=self.e.create(self.a['user_id'],'Все темы','mixed',5,60)
         self.e.cancel(first,'Cancelled')
         with patch('quizbot.engine.new_game_code',side_effect=['S23J8','AB234']) as generate:
-            second=self.e.create(self.a['user_id'],'room','Все темы','mixed',5,60)
+            second=self.e.create(self.a['user_id'],'Все темы','mixed',5,60)
             self.assertEqual(generate.call_count,2)
         self.assertEqual(self.e.one('SELECT game_code FROM games WHERE game_id=?',(second,))[0],'AB234')
         self.assertEqual(self.e.join(self.b['user_id'],'  ab234  '),second)
         self.assertEqual(self.e.one('SELECT game_code FROM games WHERE game_id=?',(first,))[0],'S23J8')
 
-    def test_friend_duel_is_not_matched_by_public_search(self):
-        private=self.e.challenge(self.a['user_id'])
-        public,started=self.e.find_duel(self.b['user_id'])
-        self.assertFalse(started)
-        self.assertNotEqual(private,public)
-        third=self.e.register(303,'Третий')
-        matched,started=self.e.find_duel(third['user_id'])
-        self.assertTrue(started)
-        self.assertEqual(matched,public)
-        self.assertEqual(self.e.one('SELECT status FROM games WHERE game_id=?',(private,))[0],'lobby')
-        self.assertEqual(len(self.e.participants(private)),1)
 
-    def test_friend_link_autostarts_duel_and_updates_same_rating(self):
-        gid=self.e.challenge(self.a['user_id'])
-        code=self.e.one('SELECT game_code FROM games WHERE game_id=?',(gid,))[0]
-        app=Application(self.e,'test_bot')
-        app.lobby(self.a,gid)
-        payload=json.loads(self.e.one("SELECT payload_json FROM outbox WHERE chat_id='101' AND slot='room'")[0])
-        self.assertIn('https://t.me/test_bot?start=join_'+code,payload['text'])
-        reply=app.handle({'message':{'from':{'id':202},'chat':{'id':202,'type':'private'},'text':'/start join_'+code}})
-        self.assertEqual(reply,'')
-        self.assertEqual(self.e.one('SELECT status FROM games WHERE game_id=?',(gid,))[0],'in_progress')
-        self.assertEqual(len(self.e.participants(gid)),2)
-        third=self.e.register(303,'Третий')
-        with self.assertRaises(RuleError):
-            self.e.join(third['user_id'],code)
-        self.answer_all(gid,self.a)
-        self.answer_all(gid,self.b,False)
-        self.assertEqual(self.e.user(101)['rating'],1016)
-        self.assertEqual(self.e.user(202)['rating'],984)
-        self.assertEqual(self.e.one("SELECT games_played FROM user_mode_stats WHERE user_id=? AND mode='duel'",(self.a['user_id'],))[0],1)
-        self.assertIn(code,self.e.results(gid))
 
-    def test_friend_invite_survives_registration_and_self_join_does_not_start(self):
-        gid=self.e.challenge(self.a['user_id'])
-        code=self.e.one('SELECT game_code FROM games WHERE game_id=?',(gid,))[0]
-        app=Application(self.e,'test_bot')
-        app.join(self.a,code)
-        self.assertEqual(len(self.e.participants(gid)),1)
-        self.assertEqual(self.e.one('SELECT status FROM games WHERE game_id=?',(gid,))[0],'lobby')
-        app.handle({'message':{'from':{'id':303},'chat':{'id':303,'type':'private'},'text':'/start join_'+code}})
-        self.assertEqual(self.e.state(303)['invite'],code)
-        app.handle({'message':{'from':{'id':303},'chat':{'id':303,'type':'private'},'text':'Новичок'}})
-        self.assertEqual(self.e.one('SELECT status FROM games WHERE game_id=?',(gid,))[0],'in_progress')
-        self.assertEqual(self.e.state(303),{})
 
-    def test_friend_link_shows_question_at_bottom_instead_of_editing_old_game(self):
-        gid=self.e.challenge(self.a['user_id'])
-        code=self.e.one('SELECT game_code FROM games WHERE game_id=?',(gid,))[0]
-        self.db.execute("INSERT INTO ui_messages VALUES('202','room',700)")
-        client=FakeClient()
-        runner=self.runner(client)
-        runner.engine=self.e
-        app=Application(self.e,'test_bot')
-        app.handle({'message':{'from':{'id':202},'chat':{'id':202,'type':'private'},'text':'/start join_'+code}})
-        with patch('quizbot.__main__.time.time',side_effect=self.clock):
-            runner.deliver()
-            self.collect(runner)
-        questions=[(method,params) for method,params in client.calls if params.get('chat_id')=='202']
-        self.assertEqual(len(questions),1)
-        self.assertEqual(questions[0][0],'sendMessage')
-        self.assertIn('Вопрос 1/10',questions[0][1]['text'])
 
-    def test_duel_menu_can_create_friend_challenge_and_search(self):
-        app=Application(self.e,'test_bot')
-        app.route('101','','duel',self.clock(),500)
-        self.assertIsNone(self.e.active(self.a['user_id']))
-        choices=json.loads(self.e.one("SELECT payload_json FROM outbox WHERE chat_id='101' AND slot='room'")[0])
-        data=[b['callback_data'] for row in choices['reply_markup']['inline_keyboard'] for b in row]
-        self.assertIn('duel_search',data)
-        self.assertIn('duel_friend',data)
-        app.route('101','','duel_friend',self.clock(),500)
-        self.assertEqual(self.e.active(self.a['user_id'])['matchmaking'],'invite')
-        app.route('202','','duel_search',self.clock(),600)
-        self.assertEqual(self.e.active(self.b['user_id'])['matchmaking'],'public')
-        self.assertNotEqual(self.e.active(self.a['user_id'])['game_id'],self.e.active(self.b['user_id'])['game_id'])
 
-    def test_friend_challenge_expires_and_can_be_cancelled(self):
-        gid=self.e.challenge(self.a['user_id'])
-        code=self.e.one('SELECT game_code FROM games WHERE game_id=?',(gid,))[0]
-        self.clock.advance(1800)
-        self.e.tick()
-        with self.assertRaises(RuleError):
-            self.e.join(self.b['user_id'],code)
-        next_game=self.e.challenge(self.a['user_id'])
-        self.e.leave(self.a['user_id'])
-        self.assertEqual(self.e.one('SELECT status FROM games WHERE game_id=?',(next_game,))[0],'cancelled')
-        self.assertEqual(self.e.user(101)['rating'],1000)
-        self.assertIsNone(self.e.one('SELECT * FROM user_mode_stats'))
 
-    def test_version_two_migration_preserves_long_codes_and_public_matchmaking(self):
-        schema=(ROOT/'quiz_bot_schema.sql').read_text(encoding='utf-8')
-        schema=schema.replace("    matchmaking TEXT NOT NULL DEFAULT 'none' CHECK(matchmaking IN ('none','public','invite')),\n",'')
-        schema=schema.replace('PRAGMA user_version = 3;','PRAGMA user_version = 2;')
-        path=Path(self.tmp.name)/'v2.db'
-        old=sqlite3.connect(path)
-        old.executescript(schema)
-        old.execute("INSERT INTO users VALUES(1,'777','Legacy','legacy',1050,0,0)")
-        old.execute("""INSERT INTO games(game_code,mode,created_by_user_id,topic,difficulty,question_count,
-            question_time_limit_seconds,created_at,lobby_expires_at)
-            VALUES('QZ-20261117-1234ABCD','duel',1,'Все темы','mixed',10,60,0,1800)""")
-        old.commit()
-        old.close()
-        migrated=connect(path)
-        try:
-            self.assertEqual(migrated.execute('PRAGMA user_version').fetchone()[0],3)
-            self.assertEqual(tuple(migrated.execute('SELECT game_code,matchmaking FROM games').fetchone()),
-                             ('QZ-20261117-1234ABCD','public'))
-            self.assertEqual(migrated.execute('SELECT rating FROM users').fetchone()[0],1050)
-            self.assertEqual(migrated.execute('SELECT COUNT(*) FROM games').fetchone()[0],1)
-        finally:
-            migrated.close()
 
     def test_unchanged_menu_edit_is_successful_without_duplicate_message(self):
         class UnchangedClient(FakeClient):
@@ -718,7 +563,7 @@ class BotTests(unittest.TestCase):
         self.assertEqual(edit['message_id'],900)
 
     def test_room_command_shows_lobby_at_bottom_of_chat(self):
-        gid=self.e.create(self.a['user_id'],'room','Все темы','mixed',5,60)
+        gid=self.e.create(self.a['user_id'],'Все темы','mixed',5,60)
         code=self.e.one('SELECT game_code FROM games WHERE game_id=?',(gid,))[0]
         self.db.execute("INSERT INTO ui_messages VALUES('101','room',700)")
         client=FakeClient()
@@ -760,7 +605,7 @@ class BotTests(unittest.TestCase):
         self.assertLess(score,q['base_points']+5)
 
     def test_room_callback_opens_the_clicked_menu(self):
-        self.e.create(self.a['user_id'],'room','Все темы','mixed',5,60)
+        self.e.create(self.a['user_id'],'Все темы','mixed',5,60)
         self.db.execute("INSERT INTO ui_messages VALUES('101','room',700)")
         client=FakeClient()
         runner=self.runner(client)
@@ -832,23 +677,9 @@ class BotTests(unittest.TestCase):
             self.clock.advance(300)
             self.e.tick()
 
-    def test_room_shows_public_search_and_friend_invite_lobbies(self):
-        app=Application(self.e,'test_bot')
-        public,_=self.e.find_duel(self.a['user_id'])
-        app.route('101','/room','',self.clock())
-        payload=json.loads(self.e.one("SELECT payload_json FROM outbox WHERE chat_id='101' AND slot='room'")[0])
-        self.assertIn('Ищем соперника',payload['text'])
-        self.assertNotIn('?start=join_',payload['text'])
-        self.e.cancel(public,'Cancelled')
-        private=self.e.challenge(self.a['user_id'])
-        app.route('101','/room','',self.clock())
-        payload=json.loads(self.e.one("SELECT payload_json FROM outbox WHERE chat_id='101' AND slot='room'")[0])
-        code=self.e.one('SELECT game_code FROM games WHERE game_id=?',(private,))[0]
-        self.assertIn('?start=join_'+code,payload['text'])
-        self.assertIn('Отправьте ссылку другу',payload['text'])
 
     def test_room_does_not_delay_scoring_when_old_question_delivery_finishes_late(self):
-        gid=self.e.create(self.a['user_id'],'room','Все темы','mixed',5,60)
+        gid=self.e.create(self.a['user_id'],'Все темы','mixed',5,60)
         code=self.e.one('SELECT game_code FROM games WHERE game_id=?',(gid,))[0]
         self.e.join(self.b['user_id'],code)
         self.e.start(gid,self.a['user_id'])
@@ -941,7 +772,7 @@ class BotTests(unittest.TestCase):
         self.assertEqual(client.calls[-1][1]['message_id'],new_id)
 
     def test_lobby_owner_has_delete_button_and_guest_has_leave(self):
-        gid=self.e.create(self.a['user_id'],'room','Все темы','mixed',5,60)
+        gid=self.e.create(self.a['user_id'],'Все темы','mixed',5,60)
         code=self.e.one('SELECT game_code FROM games WHERE game_id=?',(gid,))[0]
         self.e.join(self.b['user_id'],code)
         app=Application(self.e,'test_bot')
@@ -954,7 +785,7 @@ class BotTests(unittest.TestCase):
             self.assertEqual(any(button['text']=='Удалить' for button in buttons),user==self.a)
 
     def test_delete_lobby_requires_confirmation_and_opens_main_menu(self):
-        gid=self.e.create(self.a['user_id'],'room','Все темы','mixed',5,60)
+        gid=self.e.create(self.a['user_id'],'Все темы','mixed',5,60)
         code=self.e.one('SELECT game_code FROM games WHERE game_id=?',(gid,))[0]
         self.e.join(self.b['user_id'],code)
         client=FakeClient()
@@ -978,16 +809,14 @@ class BotTests(unittest.TestCase):
         self.assertIn('Главное меню',owner[0]['text'])
         actions=[b['callback_data'] for row in owner[0]['reply_markup']['inline_keyboard'] for b in row]
         self.assertIn('create',actions)
-        self.assertIn('duel',actions)
+        self.assertIn('join',actions)
         self.assertIsNone(self.e.active(self.a['user_id']))
         self.assertIsNone(self.e.active(self.b['user_id']))
         self.assertEqual(self.e.state(101),{})
         self.assertEqual(self.e.one('SELECT status FROM games WHERE game_id=?',(gid,))[0],'cancelled')
-        self.assertIsNone(self.e.one('SELECT * FROM user_overall_stats'))
-        self.assertEqual(self.e.user(101)['rating'],1000)
 
     def test_delete_lobby_cannot_be_used_by_guest_or_after_start(self):
-        gid=self.e.create(self.a['user_id'],'room','Все темы','mixed',5,60)
+        gid=self.e.create(self.a['user_id'],'Все темы','mixed',5,60)
         code=self.e.one('SELECT game_code FROM games WHERE game_id=?',(gid,))[0]
         self.e.join(self.b['user_id'],code)
         app=Application(self.e,'test_bot')
@@ -1004,20 +833,20 @@ class BotTests(unittest.TestCase):
         self.assertTrue(all(p['participant_status']=='playing' for p in self.e.participants(gid)))
 
     def test_delete_cancel_returns_to_lobby_and_owner_leave_uses_delete_confirmation(self):
-        gid=self.e.challenge(self.a['user_id'])
+        gid=self.e.create(self.a['user_id'],'Все темы','mixed',5,60)
         app=Application(self.e,'test_bot')
         app.route('101','/leave','',self.clock())
         payload=json.loads(self.e.one("SELECT payload_json FROM outbox WHERE chat_id='101' AND slot='room'")[0])
         self.assertIn('Удалить лобби',payload['text'])
         app.route('101','','room',self.clock(),500)
         payload=json.loads(self.e.one("SELECT payload_json FROM outbox WHERE chat_id='101' AND slot='room'")[0])
-        self.assertIn('Отправьте ссылку другу',payload['text'])
+        self.assertIn('Приглашение:',payload['text'])
         self.assertEqual(self.e.active(self.a['user_id'])['game_id'],gid)
         buttons=[b['callback_data'] for row in payload['reply_markup']['inline_keyboard'] for b in row]
         self.assertIn('delete:%s'%gid,buttons)
 
     def test_guest_leave_replaces_room_then_opens_menu_and_allows_reentry(self):
-        gid=self.e.create(self.a['user_id'],'room','Все темы','mixed',5,60)
+        gid=self.e.create(self.a['user_id'],'Все темы','mixed',5,60)
         code=self.e.one('SELECT game_code FROM games WHERE game_id=?',(gid,))[0]
         self.e.join(self.b['user_id'],code)
         self.db.execute("INSERT INTO ui_messages VALUES('202','room',600)")
@@ -1047,12 +876,11 @@ class BotTests(unittest.TestCase):
         self.assertIn('Главное меню',guest[-1]['text'])
         actions=[b['callback_data'] for row in guest[-1]['reply_markup']['inline_keyboard'] for b in row]
         self.assertIn('create',actions)
-        self.assertIn('duel',actions)
+        self.assertIn('join',actions)
         self.assertEqual(self.e.state(202),{})
         self.assertIsNone(self.e.active(self.b['user_id']))
         self.assertEqual(len(self.e.participants(gid)),1)
         self.assertEqual(self.e.active(self.a['user_id'])['game_id'],gid)
-        self.assertIsNone(self.e.one('SELECT * FROM user_overall_stats'))
         for text in ('/start join_'+code,'/join '+code.lower()):
             runner.app.handle({'message':{'from':{'id':202},'chat':{'id':202,'type':'private'},'text':text}},self.clock())
             self.assertEqual(self.e.active(self.b['user_id'])['game_id'],gid)
@@ -1067,7 +895,7 @@ class BotTests(unittest.TestCase):
             self.e.leave(self.b['user_id'])
 
     def test_guest_can_cancel_leave_and_old_confirmation_is_invalid(self):
-        gid=self.e.create(self.a['user_id'],'room','Все темы','mixed',5,60)
+        gid=self.e.create(self.a['user_id'],'Все темы','mixed',5,60)
         code=self.e.one('SELECT game_code FROM games WHERE game_id=?',(gid,))[0]
         self.e.join(self.b['user_id'],code)
         app=Application(self.e,'test_bot')
@@ -1084,7 +912,7 @@ class BotTests(unittest.TestCase):
         self.assertEqual(len(self.e.participants(gid)),2)
 
     def test_game_start_during_lobby_exit_requires_a_new_warning_and_confirmation(self):
-        gid=self.e.create(self.a['user_id'],'room','Все темы','mixed',5,60)
+        gid=self.e.create(self.a['user_id'],'Все темы','mixed',5,60)
         code=self.e.one('SELECT game_code FROM games WHERE game_id=?',(gid,))[0]
         self.e.join(self.b['user_id'],code)
         app=Application(self.e,'test_bot')
@@ -1108,17 +936,9 @@ class BotTests(unittest.TestCase):
         with self.assertRaises(RuleError):
             self.e.join(self.b['user_id'],code)
 
-    def test_started_duel_exit_confirmation_warns_about_score_and_surrender(self):
-        self.game(mode='duel')
-        app=Application(self.e,'test_bot')
-        app.route('202','','leave',self.clock(),600)
-        payload=json.loads(self.e.one("SELECT payload_json FROM outbox WHERE chat_id='202' AND slot='room'")[0])
-        self.assertIn('0 очков',payload['text'])
-        self.assertIn('сдача',payload['text'])
-        self.assertEqual(self.e.state(202)['phase'],'in_progress')
 
     def test_reentry_requires_a_free_slot_in_the_same_lobby(self):
-        gid=self.e.create(self.a['user_id'],'room','Все темы','mixed',5,60)
+        gid=self.e.create(self.a['user_id'],'Все темы','mixed',5,60)
         code=self.e.one('SELECT game_code FROM games WHERE game_id=?',(gid,))[0]
         self.e.join(self.b['user_id'],code)
         for number in range(8):

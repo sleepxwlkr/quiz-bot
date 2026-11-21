@@ -2,6 +2,8 @@ import json
 import sqlite3
 from pathlib import Path
 
+from .migrations import upgrade_to_v4
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -14,21 +16,16 @@ def connect(path):
     db.execute('PRAGMA journal_mode=WAL')
     db.execute('PRAGMA busy_timeout=5000')
     version = db.execute('PRAGMA user_version').fetchone()[0]
-    if version not in (0, 1, 2, 3):
+    if version not in (0, 1, 2, 3, 4):
         raise RuntimeError('Unsupported database version: %s' % version)
     if version == 0 and db.execute("SELECT 1 FROM sqlite_master WHERE name='users'").fetchone():
         raise RuntimeError('Old draft database detected. Use a new DATABASE_PATH; keep the old file as a backup.')
-    migration = ''
-    if version==1:
-        migration = '''ALTER TABLE game_participants ADD COLUMN question_delivered_at REAL;
-                       ALTER TABLE outbox ADD COLUMN slot TEXT;'''
-    if version in (1,2):
-        migration += """ALTER TABLE games ADD COLUMN matchmaking TEXT NOT NULL DEFAULT 'none'
-                        CHECK(matchmaking IN ('none','public','invite'));
-                        UPDATE games SET matchmaking='public' WHERE mode='duel';"""
+    schema=(ROOT / 'quiz_bot_schema.sql').read_text(encoding='utf-8')
     try:
-        db.executescript('BEGIN IMMEDIATE;\n'+migration+
-                         (ROOT / 'quiz_bot_schema.sql').read_text(encoding='utf-8')+'\nCOMMIT;')
+        if version in (1,2,3):
+            upgrade_to_v4(db,path,schema)
+        else:
+            db.executescript(schema)
     except Exception:
         db.rollback()
         db.close()

@@ -3,22 +3,37 @@ import json
 import secrets
 from datetime import datetime, timedelta, timezone
 
-from .engine import DIFFICULTIES, MODES, RuleError, keyboard, mention
+from .engine import DIFFICULTIES, RuleError, keyboard, mention
 
 LOCAL_TZ = timezone(timedelta(hours=5))
 
 
 def menu():
-    return keyboard([('Создать комнату','create'),('Дуэли','duel')],
-                    [('Войти по коду','join'),('Моя игра','room')],
+    return keyboard([('Создать комнату','create'),('Войти по коду','join')],
+                    [('Моя игра','room')],
                     [('Профиль','profile'),('История','history:0')],
-                    [('Рейтинг игроков','top'),('Правила','help')])
+                    [('Общий рейтинг','top'),('Правила','help')])
 
 
 class Application:
     def __init__(self, engine, bot_username):
         self.e = engine
         self.bot_username = bot_username
+
+    def restore_after_upgrade(self):
+        if not self.e.one("SELECT 1 FROM settings WHERE key='refresh_screens_after_upgrade'"):
+            return
+        users=self.e.all("""SELECT u.* FROM users u WHERE EXISTS
+            (SELECT 1 FROM ui_messages m WHERE m.chat_id=u.platform_user_id)
+            OR EXISTS (SELECT 1 FROM game_participants p JOIN games g USING(game_id)
+                       WHERE p.user_id=u.user_id AND g.status IN ('lobby','in_progress'))""")
+        for user in users:
+            game=self.e.active(user['user_id'])
+            if game:
+                self.lobby(user,game['game_id'])
+            else:
+                self.e.send(user['platform_user_id'],'Главное меню:',menu())
+        self.e.db.execute("DELETE FROM settings WHERE key='refresh_screens_after_upgrade'")
 
     def handle(self, update, received_at=None):
         callback = update.get('callback_query')
@@ -115,9 +130,6 @@ class Application:
             self.e.send(pid,'<b>Квиз-бот</b>\n\n'
                 'Комната: 2–10 игроков, общая тема и настройки, запуск создателем. '
                 'У всех одинаковый случайный порядок вопросов; каждый отвечает в своём темпе.\n\n'
-                'Дуэль: поиск соперника или приглашение друга по ссылке. '
-                '10 вопросов по разным темам, по 60 секунд. Рейтинг Elo: старт 1000, K=32. '
-                'Приглашённые дуэли не попадают в общий поиск и начинаются, когда друг присоединится.\n\n'
                 'Максимум за вопрос: лёгкий — 15, средний — 20, сложный — 25. '
                 'Первые 10 секунд после доставки — полный максимум. Затем очки плавно уменьшаются '
                 'до половины максимума к сроку ответа; округление до целого, штраф не больше 50%. '
@@ -125,9 +137,10 @@ class Application:
                 'Сначала сравниваются очки, затем верные ответы, затем меньшее суммарное время. '
                 'Тайм-аут добавляет полный лимит времени. При полном равенстве место общее. '
                 'Вышедшие досрочно располагаются ниже завершивших.\n\n'
-                '/create — комната\n/join КОД — присоединиться\n/duel — выбор дуэли\n/challenge — вызов другу\n/room — текущая игра\n'
+                'У каждой завершённой игры своя таблица лидеров по набранным очкам.\n\n'
+                '/create — комната\n/join КОД — присоединиться\n/room — текущая игра\n'
                 '/profile — профиль\n/nick — сменить ник\n/history — история\n/game КОД — итог игры\n'
-                '/top — общий рейтинг дуэлей\n/leave — выход с подтверждением\n/cancel — отмена ввода',menu())
+                '/top — общий рейтинг за месяц\n/leave — выход с подтверждением\n/cancel — отмена ввода',menu())
         elif cmd=='/profile' or data=='profile':
             self.profile(u)
         elif cmd=='/nick' or data=='nick':
@@ -150,19 +163,10 @@ class Application:
             else:
                 self.e.set_state(pid,{'step':'join'})
                 self.e.send(pid,'Введите код из 5 латинских букв или цифр, например S23J8. /cancel — отмена.')
-        elif cmd=='/duel' or data=='duel':
-            if self.e.active(uid):
-                raise RuleError('Вы уже участвуете в игре. Откройте /room.')
-            self.e.set_state(pid,{})
-            self.e.send(pid,'<b>Дуэли</b>\nНайти соперника или отправить вызов другу?\n'
-                        'Оба варианта: 10 вопросов, 60 секунд на вопрос, рейтинг Elo.',
-                        keyboard([('Найти соперника','duel_search')],[('Вызвать друга','duel_friend')],[('Назад','menu')]),slot='room')
-        elif data in ('duel_search','duel_friend') or cmd=='/challenge':
-            self.begin_duel(u,data=='duel_friend' or cmd=='/challenge',message_id)
         elif cmd=='/room' or data=='room' or data.startswith('lobby:'):
             g = self.e.active(uid)
             if not g:
-                raise RuleError('У вас нет активной игры. Создайте комнату или выберите дуэль. Результаты прошлых игр: /history.')
+                raise RuleError('У вас нет активной игры. Создайте комнату или войдите по коду. Результаты прошлых игр: /history.')
             self.e.set_state(pid,{})
             self.lobby(u,g['game_id'])
         elif data.startswith('start:'):
@@ -207,6 +211,8 @@ class Application:
             return self.e.answer(int(gid),uid,int(pos),int(selected),received_at)
         elif cmd=='/history' or data.startswith('history:'):
             self.history(u,int(data.split(':')[1]) if data else 0)
+        elif cmd=='/top' or data=='top':
+            self.show_leaderboard(pid)
         elif cmd=='/game':
             g = self.e.one('SELECT * FROM games WHERE game_code=?',(arg.upper(),))
             self.result_for(u,g)
@@ -215,16 +221,6 @@ class Application:
         elif data.startswith('review:'):
             _,gid,pos = data.split(':')
             self.review(u,int(gid),int(pos))
-        elif cmd=='/top' or data=='top':
-            rows = self.e.all('''SELECT u.* FROM users u WHERE EXISTS(
-                SELECT 1 FROM game_participants p JOIN games g USING(game_id)
-                WHERE p.user_id=u.user_id AND g.mode='duel' AND g.status='completed')
-                ORDER BY rating DESC,nickname_normalized LIMIT 20''')
-            lines = ['<b>Рейтинг дуэлей · топ 20</b>']
-            lines.extend('%s. %s — %s'%(i,mention(r['platform_user_id'],r['nickname']),r['rating']) for i,r in enumerate(rows,1))
-            if not rows:
-                lines.append('Пока нет завершённых дуэлей.')
-            self.e.send(pid,'\n'.join(lines),menu())
         elif text and not cmd and state.get('step')=='nick':
             changed = self.e.register(pid,text)
             self.e.set_state(pid,{})
@@ -247,8 +243,6 @@ class Application:
             text='Точно хотите покинуть комнату?'
         else:
             text='Точно хотите выйти из игры?\nОставшиеся вопросы получат 0 очков.'
-            if g['mode']=='duel':
-                text+=' В дуэли засчитается сдача.'
         self.e.send(u['platform_user_id'],text,
                     keyboard([('Да, выйти','leave_yes:%s:%s'%(g['game_id'],token)),('Отмена','room')]),slot='room')
 
@@ -263,27 +257,11 @@ class Application:
         self.e.set_state(u['platform_user_id'],{})
         self.e.send(u['platform_user_id'],'Лобби удалено.\n\nГлавное меню:',menu(),slot='room')
 
-    def begin_duel(self,u,invite,message_id):
-        if self.e.active(u['user_id']):
-            raise RuleError('Вы уже участвуете в игре. Откройте /room или выйдите через /leave.')
-        if invite:
-            gid=self.e.challenge(u['user_id'])
-            started=False
-        else:
-            gid,started=self.e.find_duel(u['user_id'])
-        self.e.set_state(u['platform_user_id'],{})
-        if not started:
-            self.lobby(u,gid)
-
     def join(self, u, code):
         gid = self.e.join(u['user_id'],code)
         self.e.set_state(u['platform_user_id'],{})
-        g = self.e.one('SELECT * FROM games WHERE game_id=?',(gid,))
-        if g['mode']=='duel' and len(self.e.participants(gid))==2:
-            self.e.start(gid,g['created_by_user_id'])
-        else:
-            for p in self.e.participants(gid):
-                self.lobby(self.e.user(p['platform_user_id']),gid)
+        for p in self.e.participants(gid):
+            self.lobby(self.e.user(p['platform_user_id']),gid)
 
     def wizard(self, pid, state):
         token = state['token']
@@ -305,7 +283,7 @@ class Application:
         if state.get('step')!='wizard' or token!=state.get('token'):
             raise RuleError('Эти настройки устарели. Откройте /create заново.')
         if key=='save':
-            gid = self.e.create(u['user_id'],'room',state['topics'][state['topic']],state['difficulty'],state['count'],state['seconds'])
+            gid = self.e.create(u['user_id'],state['topics'][state['topic']],state['difficulty'],state['count'],state['seconds'])
             self.e.set_state(u['platform_user_id'],{})
             self.lobby(u,gid)
             return
@@ -336,7 +314,7 @@ class Application:
         if g['status']=='in_progress' and p['participant_status']=='playing':
             self.e.send(u['platform_user_id'],'',kind='question',game_id=gid,user_id=u['user_id'],position=p['current_position'])
             return
-        lines = ['<b>%s</b> · <code>%s</code>'%(MODES[g['mode']],g['game_code']),
+        lines = ['<b>Комната</b> · <code>%s</code>'%g['game_code'],
                  '%s · %s · %s вопросов · %s сек.'%(html.escape(g['topic']),DIFFICULTIES[g['difficulty']],
                       g['question_count'],g['question_time_limit_seconds']),'','Участники:']
         for participant in players:
@@ -351,38 +329,32 @@ class Application:
         if g['status']=='lobby':
             if g['created_by_user_id']==u['user_id']:
                 rows = [[('Обновить','room'),('Удалить','delete:%s'%gid)]]
-            if g['mode']=='duel' and g['matchmaking']=='public':
-                lines.extend(['','Ищем соперника с ближайшим рейтингом. Дуэль начнётся автоматически.',
-                              'Поиск действует 30 минут.'])
-            else:
-                if g['mode']=='duel':
-                    lines.extend(['','Отправьте ссылку другу. Когда он присоединится, дуэль начнётся автоматически.',
-                                  'Случайные соперники сюда не подбираются. Приглашение действует 30 минут.'])
-                lines.extend(['','Приглашение: https://t.me/%s?start=join_%s'%(self.bot_username,g['game_code']),
-                              'Можно также отправить боту /join '+g['game_code']])
-            if g['mode']=='room' and u['user_id']==g['created_by_user_id']:
+            lines.extend(['','Приглашение: https://t.me/%s?start=join_%s'%(self.bot_username,g['game_code']),
+                          'Можно также отправить боту /join '+g['game_code']])
+            if u['user_id']==g['created_by_user_id']:
                 rows.insert(0,[('Начать игру','start:%s'%gid)])
         self.e.send(u['platform_user_id'],'\n'.join(lines),keyboard(*rows),slot='room')
 
     def profile(self,u):
-        s = self.e.one('SELECT * FROM user_overall_stats WHERE user_id=?',(u['user_id'],))
-        lines = ['<b>Профиль</b> · '+mention(u['platform_user_id'],u['nickname']),'Рейтинг дуэлей: %s'%u['rating']]
-        if s:
-            lines.extend(['','За всё время: %s игр · %s побед · %s общих первых мест'%
-                          (s['games_played'],s['wins'],s['shared_first_places']),
-                          'Сдач: %s · очков: %s · в среднем: %.1f'%(s['forfeits'],s['total_points'],s['average_points_per_game']),
-                          'Верных ответов: %s/%s (%.1f%%)'%(s['correct_answers'],s['total_questions'],s['accuracy_percent'])])
-        else:
-            lines.append('Завершённых игр пока нет.')
-        for m in self.e.all('SELECT * FROM user_mode_stats WHERE user_id=? ORDER BY mode',(u['user_id'],)):
-            avg_time = '—' if m['average_response_ms'] is None else '%.1f сек.'%(m['average_response_ms']/1000)
-            lines.extend(['','<b>%s</b>'%MODES[m['mode']],
-                'Игр: %s · побед: %s · общих первых мест: %s'%(m['games_played'],m['wins'],m['shared_first_places']),
-                'Средние очки: %.1f · лучший счёт: %s'%(m['average_points_per_game'],m['best_score']),
-                'Точность: %.1f%% · среднее место: %.1f'%(m['accuracy_percent'],m['average_rank']),
-                'Среднее время ответа: '+avg_time])
-        lines.append('\nВремя усредняется по отправленным ответам; тайм-ауты входят в точность как ошибки.')
+        lines = ['<b>Профиль</b>','Ваш ник: '+mention(u['platform_user_id'],u['nickname']),
+                 '\nРезультаты и таблицы лидеров доступны в истории игр.']
         self.e.send(u['platform_user_id'],'\n'.join(lines),keyboard([('Сменить ник','nick'),('История','history:0')],[('Меню','menu')]))
+
+    def show_leaderboard(self,pid):
+        now = datetime.fromtimestamp(self.e.clock(), LOCAL_TZ)
+        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        next_month = (month_start + timedelta(days=31)).replace(day=1)
+        leaders = self.e.leaderboard(month_start.timestamp(), next_month.timestamp())
+        lines = [f'<b>Общий рейтинг · {month_start:%m.%Y}</b>', '']
+        for player in leaders:
+            nickname = html.escape(player['nickname'])
+            lines.append(f"{player['place']}. {nickname} — {player['points']}")
+        if not leaders:
+            lines.append('В этом месяце пока никто не набрал баллы.')
+        lines.extend(['', '1-е место — 3 балла · 2-е — 2 · 3-е — 1.',
+                      'Баллы получают игроки, которые завершили игру и дали хотя бы один верный ответ.',
+                      'Показаны до 20 игроков за текущий месяц (UTC+5).'])
+        self.e.send(pid,'\n'.join(lines),keyboard([('Меню','menu')]))
 
     def history(self,u,page):
         page=max(0,page)
@@ -393,10 +365,10 @@ class Application:
         for g in records[:5]:
             date = datetime.fromtimestamp(g['created_at'],LOCAL_TZ).strftime('%d.%m.%Y %H:%M')
             label = {'lobby':'лобби','in_progress':'идёт','completed':'завершена','cancelled':'отменена'}[g['status']]
-            lines.append('\n<code>%s</code> · %s (UTC+5)\n%s · %s · %s\nОчки: %s · место: %s'%
-                         (g['game_code'],date,MODES[g['mode']],html.escape(g['topic']),label,g['total_score'],g['rank'] or '—'))
+            lines.append('\n<code>%s</code> · %s (UTC+5)\n%s · %s\nОчки: %s · место: %s'%
+                         (g['game_code'],date,html.escape(g['topic']),label,g['total_score'],g['rank'] or '—'))
             if g['status']=='completed':
-                rows.append([('Итоги '+g['game_code'],'result:%s'%g['game_id'])])
+                rows.append([('Рейтинг игры '+g['game_code'],'result:%s'%g['game_id'])])
         if not records:
             lines.append('Игр пока нет.')
         navigation=[]

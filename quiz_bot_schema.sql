@@ -1,11 +1,10 @@
--- SQLite, schema version 3. Times are UTC Unix seconds.
+-- SQLite, schema version 4. Times are UTC Unix seconds.
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
     platform_user_id TEXT NOT NULL UNIQUE,
     nickname TEXT NOT NULL,
     nickname_normalized TEXT NOT NULL UNIQUE,
-    rating INTEGER NOT NULL DEFAULT 1000,
     created_at REAL NOT NULL,
     last_seen_at REAL NOT NULL
 );
@@ -23,8 +22,6 @@ CREATE TABLE IF NOT EXISTS questions (
 CREATE TABLE IF NOT EXISTS games (
     game_id INTEGER PRIMARY KEY,
     game_code TEXT NOT NULL UNIQUE,
-    mode TEXT NOT NULL CHECK(mode IN ('duel','room')),
-    matchmaking TEXT NOT NULL DEFAULT 'none' CHECK(matchmaking IN ('none','public','invite')),
     status TEXT NOT NULL DEFAULT 'lobby'
         CHECK(status IN ('lobby','in_progress','completed','cancelled')),
     created_by_user_id INTEGER NOT NULL REFERENCES users(user_id),
@@ -54,9 +51,6 @@ CREATE TABLE IF NOT EXISTS game_participants (
     question_opened_at REAL,
     question_delivered_at REAL,
     question_deadline_at REAL,
-    rating_before INTEGER,
-    rating_change INTEGER,
-    rating_after INTEGER,
     joined_at REAL NOT NULL,
     finished_at REAL,
     PRIMARY KEY(game_id,user_id)
@@ -110,6 +104,7 @@ CREATE TABLE IF NOT EXISTS outbox (
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_games_status ON games(status,lobby_expires_at);
+CREATE INDEX IF NOT EXISTS idx_completed_games_finished ON games(finished_at) WHERE status='completed';
 CREATE INDEX IF NOT EXISTS idx_participants_user ON game_participants(user_id,game_id);
 CREATE INDEX IF NOT EXISTS idx_deadlines ON game_participants(participant_status,question_deadline_at);
 CREATE INDEX IF NOT EXISTS idx_questions_filter ON questions(topic,difficulty,is_active);
@@ -121,33 +116,4 @@ CREATE TABLE IF NOT EXISTS ui_messages (
     message_id INTEGER NOT NULL,
     PRIMARY KEY(chat_id,slot)
 );
-CREATE VIEW IF NOT EXISTS user_mode_stats AS
-WITH results AS (
-    SELECT p.*,g.mode,g.question_count,
-        (SELECT COUNT(*) FROM game_participants pp WHERE pp.game_id=g.game_id AND pp.rank=1) AS first_places
-    FROM game_participants p JOIN games g USING(game_id) WHERE g.status='completed'
-), times AS (
-    SELECT a.user_id,g.mode,AVG(a.response_ms) AS average_response_ms
-    FROM answers a JOIN games g USING(game_id)
-    WHERE g.status='completed' AND a.answer_status='answered' GROUP BY a.user_id,g.mode
-)
-SELECT r.user_id,r.mode,COUNT(*) AS games_played,
-    SUM(CASE WHEN rank=1 AND first_places=1 THEN 1 ELSE 0 END) AS wins,
-    SUM(CASE WHEN rank=1 AND first_places>1 THEN 1 ELSE 0 END) AS shared_first_places,
-    SUM(CASE WHEN participant_status='forfeited' THEN 1 ELSE 0 END) AS forfeits,
-    SUM(total_score) AS total_points,AVG(total_score) AS average_points_per_game,
-    MAX(total_score) AS best_score,AVG(rank) AS average_rank,
-    SUM(correct_count) AS correct_answers,SUM(question_count) AS total_questions,
-    100.0*SUM(correct_count)/SUM(question_count) AS accuracy_percent,
-    t.average_response_ms
-FROM results r LEFT JOIN times t ON t.user_id=r.user_id AND t.mode=r.mode
-GROUP BY r.user_id,r.mode;
-CREATE VIEW IF NOT EXISTS user_overall_stats AS
-SELECT user_id,SUM(games_played) AS games_played,SUM(wins) AS wins,
-    SUM(shared_first_places) AS shared_first_places,SUM(forfeits) AS forfeits,
-    SUM(total_points) AS total_points,1.0*SUM(total_points)/SUM(games_played) AS average_points_per_game,
-    MAX(best_score) AS best_score,SUM(correct_answers) AS correct_answers,
-    SUM(total_questions) AS total_questions,
-    100.0*SUM(correct_answers)/SUM(total_questions) AS accuracy_percent
-FROM user_mode_stats GROUP BY user_id;
-PRAGMA user_version = 3;
+PRAGMA user_version = 4;

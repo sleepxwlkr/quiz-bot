@@ -235,6 +235,9 @@ class Runner:
                 return
 
     def run(self):
+        with self.db:
+            self.app.restore_after_upgrade()
+            self.engine.tick()
         stop=threading.Event()
         events=queue.Queue()
         row=self.engine.one('SELECT value FROM settings WHERE key=?',(self.offset_key,))
@@ -305,10 +308,9 @@ def main():
             hook=client.call('getWebhookInfo')
             if hook.get('url'):
                 raise RuntimeError('An existing webhook is configured. Remove it before starting long polling; see README.md.')
-            commands=[('start','Главное меню'),('create','Создать комнату'),('join','Войти по коду'),('duel','Дуэли: поиск или друг'),
-                      ('challenge','Вызвать друга на дуэль'),
+            commands=[('start','Главное меню'),('create','Создать комнату'),('join','Войти по коду'),
                       ('room','Текущая игра'),('profile','Мой профиль'),('history','История игр'),('nick','Сменить ник'),
-                      ('top','Рейтинг дуэлей'),('leave','Выйти из игры'),('help','Правила')]
+                      ('top','Общий рейтинг за месяц'),('leave','Выйти из игры'),('help','Правила')]
             client.call('setMyCommands',commands=[{'command':c,'description':d} for c,d in commands])
             log.info('Bot @%s started. Stop with Ctrl+C.',me['username'])
             Runner(db,client,me['username'],me['id']).run()
