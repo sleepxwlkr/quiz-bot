@@ -73,7 +73,7 @@ class UpgradeTests(unittest.TestCase):
                 path=self.legacy(version)
                 db=connect(path)
                 try:
-                    self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],7)
+                    self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],8)
                     self.assertEqual(db.execute('SELECT COUNT(*) FROM users').fetchone()[0],5)
                     self.assertEqual(db.execute('SELECT COUNT(*) FROM games').fetchone()[0],5)
                     self.assertEqual(db.execute('SELECT game_code FROM games WHERE game_id=1').fetchone()[0],'OLD1')

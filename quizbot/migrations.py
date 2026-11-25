@@ -77,25 +77,28 @@ def upgrade_to_v4(db,path,schema):
         db.execute('PRAGMA foreign_keys=ON')
 
 
-def upgrade_question_schema(db, schema, version):
+def upgrade_schema(db, schema, version):
     try:
         db.execute('BEGIN IMMEDIATE')
+        db.execute("ALTER TABLE games ADD COLUMN play_mode TEXT NOT NULL DEFAULT 'room' CHECK(play_mode IN ('room','solo'))")
         if version == 4:
             db.execute('ALTER TABLE questions ADD COLUMN revision INTEGER NOT NULL DEFAULT 0 CHECK(revision>=0)')
-        db.execute('ALTER TABLE questions ADD COLUMN deleted_at REAL CHECK(deleted_at IS NULL OR is_active=0)')
+        if version < 7:
+            db.execute('ALTER TABLE questions ADD COLUMN deleted_at REAL CHECK(deleted_at IS NULL OR is_active=0)')
         if version == 6:
             db.execute('DROP TRIGGER question_topic_after_insert')
             db.execute('DROP TRIGGER question_topic_after_update')
             db.execute('ALTER TABLE question_topics RENAME TO _old_question_topics')
-        if version >= 5:
+        if version in (5,6):
             db.execute('ALTER TABLE question_admin_log RENAME TO _old_question_admin_log')
         execute_schema(db, schema)
         if version == 6:
             db.execute('''INSERT INTO question_topics(topic_id,name,revision)
                 SELECT topic_id,name,revision FROM _old_question_topics''')
             db.execute('DROP TABLE _old_question_topics')
-        db.execute('INSERT OR IGNORE INTO question_topics(name) SELECT DISTINCT topic FROM questions')
-        if version >= 5:
+        if version < 7:
+            db.execute('INSERT OR IGNORE INTO question_topics(name) SELECT DISTINCT topic FROM questions')
+        if version in (5,6):
             db.execute('''INSERT INTO question_admin_log(log_id,actor_telegram_id,question_id,action,occurred_at)
                 SELECT log_id,actor_telegram_id,question_id,action,occurred_at FROM _old_question_admin_log''')
             db.execute('DROP TABLE _old_question_admin_log')

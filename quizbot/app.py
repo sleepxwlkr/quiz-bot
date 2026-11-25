@@ -10,7 +10,8 @@ LOCAL_TZ = timezone(timedelta(hours=5))
 
 
 def menu():
-    return keyboard([('Создать комнату','create'),('Войти по коду','join')],
+    return keyboard([('Играть одному','solo')],
+                    [('Создать комнату','create'),('Войти по коду','join')],
                     [('Моя игра','room'),('История игр','history:0')],
                     [('Общий рейтинг','top'),('Правила','help')])
 
@@ -128,6 +129,7 @@ class Application:
             self.e.send(pid,'<b>Главное меню</b>\nВыберите действие.',menu())
         elif cmd=='/help' or data=='help':
             self.e.send(pid,'<b>Как играть</b>\n'
+                'Нажмите «Играть одному», чтобы начать одиночный квиз.\n\n'
                 'Создайте комнату на 2–10 игроков или войдите по ссылке или коду. '
                 'Игру запускает создатель. Вопросы у всех одинаковые, каждый отвечает в своём темпе.\n\n'
                 '<b>Очки за ответы</b>\n'
@@ -140,7 +142,7 @@ class Application:
                 'а затем меньшее суммарное время. Пропуск добавляет полный лимит времени. Если всё совпало, место общее. '
                 'Игроки, которые вышли досрочно, идут после тех, кто доиграл. Свои места и очки можно посмотреть в истории.\n\n'
                 '<b>Общий рейтинг за месяц</b>\n'
-                'За первые три места дают 3, 2 и 1 балл. Чтобы получить баллы, завершите игру '
+                'За первые три места в комнате дают 3, 2 и 1 балл. Чтобы получить баллы, завершите игру '
                 'и дайте хотя бы один верный ответ.\n\n'
                 'Команда /room вернёт к текущей игре, а /leave откроет подтверждение выхода.',
                 keyboard([('Меню','menu')]))
@@ -148,17 +150,32 @@ class Application:
             self.e.set_state(pid,{'step':'nick'})
             self.e.send(pid,'<b>Смена ника</b>\nВведите новый ник от 3 до 24 символов. '
                         'В итогах прошлых игр останется прежний ник.\n\nДля отмены отправьте /cancel.')
-        elif cmd=='/create' or data=='create':
+        elif cmd=='/create' or data in ('create','solo'):
             if self.e.active(uid):
                 raise RuleError('У вас уже есть игра. Чтобы открыть её, нажмите «Моя игра» или отправьте /room.')
             topics = [r[0] for r in self.e.all('SELECT DISTINCT topic FROM questions WHERE is_active=1 ORDER BY topic')]
             topics.insert(0,'Все темы')
-            state = {'step':'wizard','token':secrets.token_hex(3),'topics':topics,
-                     'topic':0,'difficulty':'mixed','count':10,'seconds':60}
+            solo = data=='solo'
+            available = self.e.available_question_count('Все темы','mixed')
+            count = 10
+            if solo:
+                if available < QUESTION_COUNTS[0]:
+                    raise RuleError('Для одиночной игры нужно хотя бы 5 доступных вопросов.')
+                count = max(n for n in QUESTION_COUNTS if n<=min(10,available))
+            state = {'step':'wizard','token':secrets.token_hex(3),'topics':topics,'solo':solo,
+                     'topic':0,'difficulty':'mixed','count':count,'seconds':60}
             self.e.set_state(pid,state)
-            self.wizard(pid,state)
+            self.wizard(pid,state,available)
         elif data.startswith('w:'):
             self.wizard_action(u,data,state)
+        elif data.startswith('solo_again:'):
+            previous = self.e.one("""SELECT topic,difficulty,question_count,question_time_limit_seconds
+                FROM games WHERE game_id=? AND created_by_user_id=? AND play_mode='solo' AND status='completed'""",
+                (int(data.split(':')[1]),uid))
+            if previous is None:
+                raise RuleError('Не удалось найти завершённую одиночную игру. Откройте «Играть одному».')
+            self.e.create(uid,*previous,solo=True)
+            self.e.set_state(pid,{})
         elif cmd=='/join' or data=='join':
             if arg:
                 self.join(u,arg)
@@ -170,7 +187,7 @@ class Application:
         elif cmd=='/room' or data=='room' or data.startswith('lobby:'):
             g = self.e.active(uid)
             if not g:
-                raise RuleError('У вас пока нет активной игры. Создайте комнату или войдите по коду. '
+                raise RuleError('У вас пока нет активной игры. Начните одиночную игру, создайте комнату или войдите по коду. '
                                 'Итоги прошлых игр можно посмотреть в /history.')
             self.e.set_state(pid,{})
             self.lobby(g['game_id'],uid)
@@ -206,8 +223,11 @@ class Application:
                 return ''
             self.e.leave(uid)
             self.e.set_state(pid,{})
-            self.e.send(pid,('Вы покинули комнату.' if g['status']=='lobby' else 'Вы вышли из игры.')+
-                        '\n\n<b>Главное меню</b>',menu(),slot='room')
+            if g['play_mode']=='solo':
+                message = 'Одиночная игра отменена.'
+            else:
+                message = 'Вы покинули комнату.' if g['status']=='lobby' else 'Вы вышли из игры.'
+            self.e.send(pid,message+'\n\n<b>Главное меню</b>',menu(),slot='room')
             if g['status']=='lobby':
                 self.lobby(g['game_id'])
         elif data.startswith('a:'):
@@ -235,7 +255,9 @@ class Application:
         token=secrets.token_hex(4)
         self.e.set_state(u['platform_user_id'],{'step':'confirm_leave','game_id':g['game_id'],
                                               'phase':g['status'],'token':token})
-        if g['status']=='lobby':
+        if g['play_mode']=='solo':
+            text='Точно хотите выйти? Одиночная игра будет отмечена как отменённая.'
+        elif g['status']=='lobby':
             text='Точно хотите покинуть комнату?'
         else:
             text='Точно хотите выйти из игры?\n\nЗа оставшиеся вопросы вы получите 0 очков.'
@@ -258,30 +280,37 @@ class Application:
         self.e.set_state(u['platform_user_id'],{})
         self.lobby(gid)
 
-    def wizard(self, pid, state, available=None):
+    def wizard(self, pid, state, available):
         token = state['token']
         def button(label,key,value):
             return label,'w:%s:%s:%s'%(token,key,value)
         topic = state['topics'][state['topic']]
+        solo = state.get('solo',False)
+        title = 'Одиночная игра' if solo else 'Настройки комнаты'
+        action = 'Начать' if solo else 'Создать комнату'
         rows = [[button(t,'topic',i)] for i,t in enumerate(state['topics'])]
         rows.append([button(v,'difficulty',k) for k,v in DIFFICULTIES.items()])
-        if available is None:
-            available = self.e.available_question_count(topic,state['difficulty'])
-        rows.append([button(str(n)+' вопр.','count',n) for n in QUESTION_COUNTS if n<=available])
+        counts = [button(str(n)+' вопр.','count',n) for n in QUESTION_COUNTS if n<=available]
+        if counts:
+            rows.append(counts)
         rows.append([button(str(s)+' сек.','seconds',s) for s in QUESTION_TIMES])
-        rows.append([button('Создать комнату','save','yes'),('Отмена','menu')])
-        self.e.send(pid,'<b>Настройки комнаты</b>\n\nТема — %s\nСложность — %s\nВопросов — %s\nВремя на вопрос — %s с\n\n'
-                    'Чтобы изменить настройку, выберите значение ниже. Когда всё готово, нажмите «Создать комнату».'%
-                    (html.escape(topic),DIFFICULTIES[state['difficulty']],state['count'],state['seconds']),keyboard(*rows),slot='room')
+        rows.append([button(action,'save','yes'),('Отмена','menu')])
+        self.e.send(pid,'<b>%s</b>\n\nТема — %s\nСложность — %s\nВопросов — %s\nВремя на вопрос — %s с\n\n'
+                    'Чтобы изменить настройку, выберите значение ниже. Когда всё готово, нажмите «%s».'%
+                    (title,html.escape(topic),DIFFICULTIES[state['difficulty']],state['count'],state['seconds'],action),
+                    keyboard(*rows),slot='room')
 
     def wizard_action(self,u,data,state):
         _,token,key,value = data.split(':')
         if state.get('step')!='wizard' or token!=state.get('token'):
-            raise RuleError('Эти настройки устарели. Отправьте /create, чтобы начать заново.')
+            raise RuleError('Эти настройки устарели. Откройте главное меню, чтобы начать заново.')
         if key=='save':
-            gid = self.e.create(u['user_id'],state['topics'][state['topic']],state['difficulty'],state['count'],state['seconds'])
+            solo = state.get('solo',False)
+            gid = self.e.create(u['user_id'],state['topics'][state['topic']],state['difficulty'],
+                                state['count'],state['seconds'],solo=solo)
             self.e.set_state(u['platform_user_id'],{})
-            self.lobby(gid,u['user_id'])
+            if not solo:
+                self.lobby(gid,u['user_id'])
             return
         allowed = {'topic':range(len(state['topics'])),'difficulty':DIFFICULTIES,
                    'count':QUESTION_COUNTS,'seconds':QUESTION_TIMES}
@@ -355,14 +384,14 @@ class Application:
         if not leaders:
             lines.append('В этом месяце пока никто не набрал баллы.')
         lines.extend(['', '<b>Как получить баллы</b>',
-                      '1-е место — 3 балла · 2-е — 2 балла · 3-е — 1 балл.',
+                      'В игре в комнате 1-е место даёт 3 балла, 2-е — 2, 3-е — 1.',
                       'Чтобы получить баллы, завершите игру и дайте хотя бы один верный ответ.',
                       'В таблице до 20 игроков. При равном числе баллов место общее.'])
         self.e.send(pid,'\n'.join(lines),keyboard([('Меню','menu')]))
 
     def history(self,u,page):
         page=max(0,page)
-        records = self.e.all('''SELECT g.game_code,g.created_at,g.status,p.total_score,p.rank
+        records = self.e.all('''SELECT g.game_code,g.created_at,g.status,g.play_mode,p.total_score,p.rank
             FROM games g JOIN game_participants p USING(game_id)
             WHERE p.user_id=? ORDER BY p.game_id DESC LIMIT 6 OFFSET ?''',(u['user_id'],page*5))
         lines = [f'<b>История игр · страница {page+1}</b>', '']
@@ -373,7 +402,8 @@ class Application:
             if g['status']=='completed':
                 place = f"{g['rank']}-е место, " if g['rank'] is not None else ''
                 status += ' · '+place+format_count(g['total_score'],'очко','очка','очков')
-            lines.append(f'<code>{code}</code> · {date} · {status}')
+            mode = ' · Одиночная' if g['play_mode']=='solo' else ''
+            lines.append(f'<code>{code}</code> · {date}{mode} · {status}')
         if not records:
             lines.append('Игр пока нет.')
         navigation=[]

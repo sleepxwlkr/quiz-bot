@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import queue
+import signal
 import sys
 import threading
 import time
@@ -65,7 +66,9 @@ class Runner:
         self.db=db
         self.client=client
         self.engine=Engine(db)
-        self.app=Application(self.engine,username,admin_ids)
+        self.username=username
+        self.admin_ids=tuple(sorted(set(map(str,admin_ids))))
+        self.app=Application(self.engine,username,self.admin_ids)
         self.offset_key='update_offset:%s'%bot_id
         self.last_send={}
         self.api_available_at=0
@@ -247,6 +250,13 @@ class Runner:
             self.db.execute('DELETE FROM conversations')
             self.db.execute('DELETE FROM outbox')
 
+    def notify_admins(self,text):
+        for chat_id in self.admin_ids:
+            try:
+                self.client.call('sendMessage',chat_id=chat_id,text=text)
+            except TelegramError as exc:
+                log.warning('Could not send bot status to an administrator: code=%s',exc.code)
+
     def run(self):
         self.reset_session()
         stop=threading.Event()
@@ -255,7 +265,10 @@ class Runner:
         poller=threading.Thread(target=self._poll,args=(events,stop,int(row[0]) if row else 0),
                                 name='telegram-poll',daemon=True)
         poller.start()
+        startup_notice=None
         try:
+            if self.admin_ids:
+                startup_notice=self.executor.submit(self.notify_admins,f'🟢 Бот @{self.username} запущен.')
             while True:
                 self.deliver()
                 try:
@@ -277,7 +290,12 @@ class Runner:
                 handled.set()
         finally:
             stop.set()
-            self.close()
+            try:
+                if startup_notice is not None:
+                    startup_notice.result()
+                self.close()
+            finally:
+                self.notify_admins(f'🔴 Бот @{self.username} остановлен.')
 
 
 def main():
@@ -337,6 +355,7 @@ def main():
 
 
 if __name__=='__main__':
+    signal.signal(signal.SIGTERM,signal.default_int_handler)
     try:
         sys.exit(main())
     except KeyboardInterrupt:

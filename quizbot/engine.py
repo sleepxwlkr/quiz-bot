@@ -179,33 +179,39 @@ class Engine:
         clause, params = question_filter(topic,difficulty)
         return self.one('SELECT COUNT(*)'+clause, params)[0]
 
-    def create(self, user_id, topic, difficulty, count, seconds):
+    def create(self, user_id, topic, difficulty, count, seconds, *, solo=False):
         if self.active(user_id):
             raise RuleError('У вас уже есть игра. Откройте её через /room или выйдите с помощью /leave.')
         if difficulty not in DIFFICULTIES or count not in QUESTION_COUNTS or seconds not in QUESTION_TIMES:
             raise RuleError('Эти настройки недоступны. Выберите значения из кнопок в меню комнаты.')
-        if self.available_question_count(topic,difficulty) < count:
+        bank = self.available_questions(topic,difficulty) if solo else None
+        available = len(bank) if bank is not None else self.available_question_count(topic,difficulty)
+        if available < count:
             raise RuleError('Для этой темы и сложности мало вопросов. Выберите меньше вопросов или другую сложность.')
         now = self.clock()
         for _ in range(100):
             code = new_game_code()
             try:
                 cur = self.db.execute('''INSERT INTO games(game_code,created_by_user_id,topic,difficulty,
-                    question_count,question_time_limit_seconds,created_at,lobby_expires_at,scoring_version)
-                    VALUES(?,?,?,?,?,?,?,?,2)''',
-                    (code,user_id,topic,difficulty,count,seconds,now,now+1800))
+                    question_count,question_time_limit_seconds,created_at,lobby_expires_at,scoring_version,play_mode)
+                    VALUES(?,?,?,?,?,?,?,?,2,?)''',
+                    (code,user_id,topic,difficulty,count,seconds,now,now+1800,'solo' if solo else 'room'))
                 break
             except sqlite3.IntegrityError as exc:
                 if 'games.game_code' not in str(exc):
                     raise
         else:
             raise RuleError('Не удалось подобрать свободный код. Попробуйте ещё раз.')
-        self.join(user_id, code)
-        return cur.lastrowid
+        gid = cur.lastrowid
+        self.add_participant(gid,user_id)
+        if solo:
+            game = self.one('SELECT * FROM games WHERE game_id=?', (gid,))
+            self._start_game(game,self.participants(gid),bank)
+        return gid
 
     def join(self, user_id, code):
         game = self.one('SELECT * FROM games WHERE game_code=?', (code.strip().upper(),))
-        if not game:
+        if not game or game['play_mode']!='room':
             raise RuleError('Комната не найдена. Проверьте код и попробуйте войти снова.')
         if game['status'] in ('in_progress','completed'):
             raise RuleError('Игра в этой комнате уже началась. Попросите у создателя код следующей игры.')
@@ -218,10 +224,13 @@ class Engine:
         size = self.one('SELECT COUNT(*) FROM game_participants WHERE game_id=?', (game['game_id'],))[0]
         if size >= 10:
             raise RuleError('В комнате заняты все 10 мест. Попробуйте войти позже или выберите другую комнату.')
-        u = self.one('SELECT * FROM users WHERE user_id=?', (user_id,))
-        self.db.execute('INSERT INTO game_participants(game_id,user_id,nickname_at_game,joined_at) VALUES(?,?,?,?)',
-                        (game['game_id'],user_id,u['nickname'],self.clock()))
+        self.add_participant(game['game_id'],user_id)
         return game['game_id']
+
+    def add_participant(self, gid, user_id):
+        user = self.one('SELECT nickname FROM users WHERE user_id=?', (user_id,))
+        self.db.execute('INSERT INTO game_participants(game_id,user_id,nickname_at_game,joined_at) VALUES(?,?,?,?)',
+                        (gid,user_id,user['nickname'],self.clock()))
 
     def participants(self, gid):
         return self.all('''SELECT p.*,u.platform_user_id,u.nickname FROM game_participants p
@@ -229,7 +238,7 @@ class Engine:
 
     def start(self, gid, owner_id):
         g = self.one('SELECT * FROM games WHERE game_id=?', (gid,))
-        if not g or g['created_by_user_id'] != owner_id:
+        if not g or g['play_mode']!='room' or g['created_by_user_id'] != owner_id:
             raise RuleError('Запустить игру может только создатель комнаты.')
         if g['status'] != 'lobby' or g['lobby_expires_at'] <= self.clock():
             raise RuleError('Комната закрыта или игра уже началась. Проверьте её через /room.')
@@ -240,6 +249,10 @@ class Engine:
         if len(bank) < g['question_count']:
             raise RuleError('Для этих настроек уже не хватает вопросов. Создайте комнату с другой темой, '
                             'сложностью или меньшим числом вопросов.')
+        self._start_game(g,players,bank)
+
+    def _start_game(self, g, players, bank):
+        gid = g['game_id']
         for pos,q in enumerate(random.SystemRandom().sample(bank,g['question_count']),1):
             options = json.loads(q['options_json'])
             order = list(range(len(options)))
@@ -258,15 +271,17 @@ class Engine:
 
     def open_question(self, gid, uid, position, opened_at):
         g = self.one('SELECT * FROM games WHERE game_id=?', (gid,))
-        u = self.one('SELECT platform_user_id FROM users WHERE user_id=?', (uid,))
         if position > g['question_count']:
             self.db.execute('''UPDATE game_participants SET participant_status='finished',
                 question_deadline_at=NULL,finished_at=? WHERE game_id=? AND user_id=?''', (opened_at,gid,uid))
-            self.send(u[0],'<b>Вы закончили отвечать</b>\nИтоги появятся здесь, когда закончат остальные игроки.',slot='room')
+            if g['play_mode']=='room':
+                u = self.one('SELECT platform_user_id FROM users WHERE user_id=?', (uid,))
+                self.send(u[0],'<b>Вы закончили отвечать</b>\nИтоги появятся здесь, когда закончат остальные игроки.',slot='room')
             return None
         deadline = min(opened_at+g['question_time_limit_seconds'],g['hard_deadline_at'])
         self.db.execute('''UPDATE game_participants SET current_position=?,question_opened_at=?,
             question_deadline_at=?,question_delivered_at=NULL WHERE game_id=? AND user_id=?''', (position,opened_at,deadline,gid,uid))
+        u = self.one('SELECT platform_user_id FROM users WHERE user_id=?', (uid,))
         self.send(u[0],'',kind='question',game_id=gid,user_id=uid,position=position)
         return deadline
 
@@ -325,6 +340,11 @@ class Engine:
         players = self.participants(gid)
         if any(p['participant_status']=='playing' for p in players):
             return
+        if g['play_mode']=='solo':
+            self.db.execute("UPDATE games SET status='completed',finished_at=? WHERE game_id=?", (self.clock(),gid))
+            self.send(players[0]['platform_user_id'],self.results(gid),
+                      keyboard([('Сыграть ещё',f'solo_again:{gid}'),('Меню','menu')]))
+            return
         def key(p):
             return (p['participant_status']=='forfeited',-p['total_score'],-p['correct_count'],p['total_response_ms'])
         ordered = sorted(players,key=key)
@@ -361,6 +381,12 @@ class Engine:
         g = self.active(uid)
         if not g:
             raise RuleError('У вас нет активной игры.')
+        if g['play_mode']=='solo':
+            now = self.clock()
+            self.db.execute("UPDATE games SET status='cancelled',finished_at=? WHERE game_id=?", (now,g['game_id']))
+            self.db.execute('''UPDATE game_participants SET participant_status='forfeited',
+                question_deadline_at=NULL,finished_at=? WHERE game_id=? AND user_id=?''', (now,g['game_id'],uid))
+            return
         if g['status']=='lobby':
             if g['created_by_user_id']==uid:
                 self.cancel(g['game_id'],'Создатель закрыл комнату.')
@@ -379,10 +405,17 @@ class Engine:
 
     def results(self, gid):
         g = self.one('SELECT * FROM games WHERE game_id=?', (gid,))
+        players = self.participants(gid)
+        if g['play_mode']=='solo':
+            player = players[0]
+            maximum = self.one('SELECT SUM(base_points+5) FROM game_questions WHERE game_id=?', (gid,))[0]
+            return (f"<b>Итоги одиночной игры</b> · <code>{g['game_code']}</code>\n\n"
+                    f"Верных ответов — {player['correct_count']} из {g['question_count']}\n"
+                    f"Очки — {player['total_score']} из {maximum} возможных")
         lines = ['🏆 <b>Итоги игры</b> · <code>%s</code>' % g['game_code'],
                  '%s · %s вопросов' % (html.escape(g['topic']),g['question_count']),'',
                  '<b>Таблица лидеров</b>']
-        for p in self.participants(gid):
+        for p in players:
             label = mention(p['platform_user_id'],p['nickname_at_game'])
             score = format_count(p['total_score'],'очко','очка','очков')
             line = f"{p['rank']}. {label} — {score} · верно {p['correct_count']} из {g['question_count']}"
@@ -396,7 +429,7 @@ class Engine:
             WITH scores AS (
                 SELECT p.user_id, SUM(4 - p.rank) AS points
                 FROM games g JOIN game_participants p USING (game_id)
-                WHERE g.status='completed' AND g.finished_at>=? AND g.finished_at<?
+                WHERE g.play_mode='room' AND g.status='completed' AND g.finished_at>=? AND g.finished_at<?
                   AND p.participant_status='finished' AND p.correct_count>0
                   AND p.rank BETWEEN 1 AND 3
                 GROUP BY p.user_id
@@ -409,7 +442,7 @@ class Engine:
         ''', (start_at, end_at))
 
     def question_payload(self, row):
-        p = self.one('''SELECT p.*,g.status,g.question_count,g.game_code FROM game_participants p
+        p = self.one('''SELECT p.*,g.status,g.question_count,g.game_code,g.play_mode FROM game_participants p
             JOIN games g USING(game_id) WHERE p.game_id=? AND p.user_id=?''', (row['game_id'],row['user_id']))
         if not p or p['status']!='in_progress' or p['participant_status']!='playing' or p['current_position']!=row['position']:
             return None
@@ -419,6 +452,8 @@ class Engine:
         q = self.one('SELECT * FROM game_questions WHERE game_id=? AND position=?', (p['game_id'],p['current_position']))
         rows = [[(text,'a:%s:%s:%s'%(p['game_id'],p['current_position'],idx))]
                 for idx,text in enumerate(json.loads(q['options_snapshot']))]
+        if p['play_mode']=='solo':
+            rows.append([('Выйти','leave')])
         timeout_note = ''
         previous = self.one('SELECT answer_status FROM answers WHERE game_id=? AND user_id=? AND question_position=?',
                             (p['game_id'],p['user_id'],p['current_position']-1))

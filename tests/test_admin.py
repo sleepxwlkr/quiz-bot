@@ -13,7 +13,7 @@ from quizbot.app import Application
 from quizbot.db import ROOT, connect, initialize_question_bank, seed_questions
 from quizbot.engine import Engine, RuleError
 from quizbot.questions import QuestionBank
-from tests.test_bot import Clock, FakeClient
+from tests.test_bot import Clock, FakeClient, write_question_bank
 
 
 class AdminTests(unittest.TestCase):
@@ -21,6 +21,7 @@ class AdminTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.path = Path(self.directory.name) / 'admin.db'
+        self.bank_path = write_question_bank(self.path.parent)
         self.db = None
         self.runner = None
         self.clock = Clock()
@@ -267,7 +268,7 @@ class AdminTests(unittest.TestCase):
         self.assertEqual(self.e.one("SELECT actor_telegram_id FROM question_admin_log WHERE action='edit'")[0], '202')
 
     def test_saved_game_snapshots_and_answers_survive_bank_edits(self):
-        seed_questions(self.db)
+        seed_questions(self.db,self.bank_path)
         owner = self.e.register(303, 'Участник А')['user_id']
         guest = self.e.register(404, 'Участник Б')['user_id']
         gid = self.e.create(owner, 'Информатика', 'easy', 5, 60)
@@ -313,7 +314,7 @@ class AdminTests(unittest.TestCase):
             self.e.join(guest, code)
 
     def test_admin_edit_survives_cli_startup_and_explicit_import_updates_by_key(self):
-        with self.db:
+        with patch('quizbot.db.DEFAULT_QUESTION_BANK',self.bank_path):
             self.assertEqual(initialize_question_bank(self.db), 60)
         self.open_questions(difficulty='Лёгкая')
         self.press('Поиск')
@@ -340,12 +341,20 @@ class AdminTests(unittest.TestCase):
             with closing(connect(self.path)) as db:
                 row = db.execute("SELECT question_text,is_active FROM questions WHERE source_key='it-e01'").fetchone()
                 self.assertEqual(tuple(row), ('Изменённый вопрос из штатного банка', 0))
-            with patch('sys.argv', ['quizbot', '--import-questions', str(ROOT/'data'/'questions.json')]):
+            with patch('sys.argv', ['quizbot', '--import-questions', str(self.bank_path)]):
                 self.assertEqual(main(), 0)
         self.open()
         row = self.e.one("SELECT question_text,is_active,revision FROM questions WHERE source_key='it-e01'")
         self.assertEqual(tuple(row), ('Сколько битов в одном байте?', 0, 3))
         self.assertEqual(self.e.one('SELECT COUNT(*) FROM question_admin_log')[0], 2)
+
+    def test_init_db_accepts_an_empty_bank_without_a_starting_file(self):
+        env = {'DATABASE_PATH': str(self.path)}
+        with patch.dict(os.environ, env), patch('quizbot.__main__.load_env'), \
+                patch('sys.argv', ['quizbot', '--init-db']), \
+                patch('quizbot.db.DEFAULT_QUESTION_BANK',self.path.with_suffix('.missing.json')):
+            self.assertEqual(main(), 0)
+        self.assertEqual(self.e.one('SELECT COUNT(*) FROM questions')[0], 0)
 
     def test_empty_topic_survives_restart_and_opens_a_scoped_question_list(self):
         self.update(text='/admin')
@@ -389,7 +398,7 @@ class AdminTests(unittest.TestCase):
         self.assertEqual(self.e.one('SELECT COUNT(*) FROM question_topics')[0], 9)
 
     def test_rename_propagates_to_bank_and_open_lobbies_but_preserves_started_games(self):
-        seed_questions(self.db)
+        seed_questions(self.db,self.bank_path)
         owner = self.e.register(303, 'Первый')['user_id']
         guest = self.e.register(404, 'Второй')['user_id']
         waiting = self.e.register(505, 'Третий')['user_id']
@@ -418,7 +427,7 @@ class AdminTests(unittest.TestCase):
         self.assertIn('Программирование', self.screen()['text'])
 
     def test_question_deletion_needs_confirmation_and_keeps_saved_game_snapshots(self):
-        seed_questions(self.db)
+        seed_questions(self.db,self.bank_path)
         owner = self.e.register(101, 'Алиса')['user_id']
         guest = self.e.register(202, 'Борис')['user_id']
         gid = self.e.create(owner, 'Информатика', 'easy', 5, 60)
@@ -460,7 +469,7 @@ class AdminTests(unittest.TestCase):
         self.close()
         self.open()
         self.assertEqual(initialize_question_bank(self.db), 59)
-        self.assertEqual(seed_questions(self.db), 59)
+        self.assertEqual(seed_questions(self.db,self.bank_path), 59)
         self.assertIsNone(QuestionBank(self.db).get(question_id))
         self.assertEqual(self.e.one('SELECT source_key FROM questions WHERE question_id=?', (question_id,))[0], key)
 
@@ -525,6 +534,10 @@ class AdminTests(unittest.TestCase):
 class AdminMigrationTests(unittest.TestCase):
     def legacy_schema(self, version):
         schema = (ROOT/'quiz_bot_schema.sql').read_text(encoding='utf-8')
+        schema = schema.replace("    play_mode TEXT NOT NULL DEFAULT 'room' CHECK(play_mode IN ('room','solo')),\n", '')
+        schema = schema.replace('PRAGMA user_version = 8;', f'PRAGMA user_version = {version};')
+        if version == 7:
+            return schema
         questions = schema[:schema.index('CREATE TABLE IF NOT EXISTS question_topics')]
         questions = questions.replace(',\n    deleted_at REAL CHECK(deleted_at IS NULL OR is_active=0)', '')
         if version == 4:
@@ -547,7 +560,7 @@ class AdminMigrationTests(unittest.TestCase):
             END;
             '''
         games = schema[schema.index('CREATE TABLE IF NOT EXISTS games'):]
-        return questions + games.replace('PRAGMA user_version = 7;', f'PRAGMA user_version = {version};')
+        return questions + games
 
     def test_upgrade_keeps_audit_and_backfills_only_missing_topics(self):
         for version in (5, 6):
@@ -568,7 +581,7 @@ class AdminMigrationTests(unittest.TestCase):
                 before = old.execute('SELECT * FROM questions').fetchone()
                 audit = old.execute('SELECT * FROM question_admin_log').fetchall()
             with closing(connect(path)) as current:
-                self.assertEqual(current.execute('PRAGMA user_version').fetchone()[0], 7)
+                self.assertEqual(current.execute('PRAGMA user_version').fetchone()[0], 8)
                 self.assertEqual(tuple(current.execute('SELECT * FROM questions').fetchone()), (*before, None))
                 self.assertEqual([tuple(row) for row in current.execute('SELECT * FROM question_admin_log')],
                                  [(*audit[0], None)])
@@ -585,29 +598,60 @@ class AdminMigrationTests(unittest.TestCase):
             with closing(sqlite3.connect(path)) as old:
                 old.executescript(self.legacy_schema(4))
                 old.row_factory = sqlite3.Row
-                defaults = json.loads((ROOT/'data'/'questions.json').read_text(encoding='utf-8'))[:5]
+                defaults = json.loads(write_question_bank(path.parent).read_text(encoding='utf-8'))[:5]
                 old.executemany('''INSERT INTO questions(source_key,topic,difficulty,question_text,options_json,correct_answer)
                     VALUES(?,?,?,?,?,?)''', [(q['key'], q['topic'], q['difficulty'], q['text'],
                                              json.dumps(q['options']), q['correct']) for q in defaults])
                 engine = Engine(old, Clock())
                 owner = engine.register(101, 'Первый')['user_id']
                 guest = engine.register(202, 'Второй')['user_id']
-                old.execute("INSERT INTO settings VALUES('outbox_sequence','0')")
-                gid = engine.create(owner, 'Все темы', 'mixed', 5, 60)
-                engine.join(guest, engine.active(owner)['game_code'])
-                engine.start(gid, owner)
+                now = engine.clock()
+                gid = old.execute('''INSERT INTO games(game_code,status,created_by_user_id,topic,difficulty,
+                    question_count,question_time_limit_seconds,created_at,started_at,lobby_expires_at,hard_deadline_at)
+                    VALUES('OLD88','in_progress',?,'Все темы','mixed',5,60,?,?,?,?)''',
+                    (owner, now, now, now+1800, now+300)).lastrowid
+                engine.add_participant(gid, owner)
+                engine.add_participant(gid, guest)
+                old.execute('''INSERT INTO game_questions(game_id,position,question_id,topic_snapshot,
+                    difficulty_snapshot,question_snapshot,options_snapshot,correct_answer_snapshot,base_points)
+                    SELECT ?,question_id,question_id,topic,difficulty,question_text,options_json,correct_answer,10
+                    FROM questions''', (gid,))
                 old.execute("INSERT INTO answers VALUES(?,?,1,'answered',0,1,1000,15,?)", (gid, owner, engine.clock()))
                 old.commit()
                 before = {table: [tuple(row) for row in old.execute('SELECT * FROM '+table)] for table in tables}
             with closing(connect(path)) as current:
-                self.assertEqual(current.execute('PRAGMA user_version').fetchone()[0], 7)
+                self.assertEqual(current.execute('PRAGMA user_version').fetchone()[0], 8)
                 for table, rows in before.items():
                     saved_columns = 'question_id,source_key,topic,difficulty,question_text,options_json,correct_answer,explanation,is_active'
                     selection = saved_columns if table == 'questions' else '*'
-                    self.assertEqual([tuple(row) for row in current.execute(f'SELECT {selection} FROM {table}')], rows)
+                    expected = [(*row,'room') for row in rows] if table == 'games' else rows
+                    self.assertEqual([tuple(row) for row in current.execute(f'SELECT {selection} FROM {table}')], expected)
                 self.assertEqual(current.execute('SELECT MAX(revision) FROM questions').fetchone()[0], 0)
                 self.assertEqual(current.execute('SELECT name FROM question_topics').fetchone()[0], 'Информатика')
                 QuestionBank(current).set_active(1, 0, 0, '101', Clock()())
                 current.commit()
                 self.assertEqual(current.execute('SELECT action FROM question_admin_log').fetchone()[0], 'disable')
+                self.assertIsNone(current.execute('PRAGMA foreign_key_check').fetchone())
+
+    def test_v7_upgrade_marks_previous_games_as_rooms_and_keeps_deleted_topics_hidden(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'v7.db'
+            with closing(sqlite3.connect(path)) as old:
+                old.executescript(self.legacy_schema(7))
+                old.row_factory = sqlite3.Row
+                now = Clock()()
+                owner = Engine(old, Clock()).register(101, 'Первый')['user_id']
+                old.execute('''INSERT INTO games(game_code,status,created_by_user_id,topic,difficulty,question_count,
+                    question_time_limit_seconds,created_at,finished_at,lobby_expires_at)
+                    VALUES('OLD88','completed',?,'Информатика','easy',5,60,?,?,?)''', (owner,now,now,now+1800))
+                seed_questions(old,write_question_bank(path.parent))
+                bank = QuestionBank(old)
+                topic = bank.topic_by_name('Информатика')
+                bank.delete_topic(topic['topic_id'],topic['revision'],'101',now)
+                old.commit()
+            with closing(connect(path)) as current:
+                self.assertEqual(current.execute('PRAGMA user_version').fetchone()[0], 8)
+                self.assertEqual(tuple(current.execute('SELECT game_code,status,play_mode FROM games').fetchone()),
+                                 ('OLD88','completed','room'))
+                self.assertIsNone(QuestionBank(current).topic_by_name('Информатика'))
                 self.assertIsNone(current.execute('PRAGMA foreign_key_check').fetchone())

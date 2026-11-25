@@ -8,10 +8,10 @@ from unittest.mock import patch
 
 from quizbot.app import Application, LOCAL_TZ
 from quizbot.db import connect, seed_questions
-from quizbot.engine import Engine
+from quizbot.engine import Engine, RuleError
 from quizbot.__main__ import Runner
 from quizbot.telegram import TelegramError
-from tests.test_bot import Clock, FakeClient
+from tests.test_bot import Clock, FakeClient, write_question_bank
 
 
 class VisibleClient(FakeClient):
@@ -38,7 +38,7 @@ class ScreenTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory()
         self.db=connect(Path(self.tmp.name)/'screens.db')
-        seed_questions(self.db)
+        seed_questions(self.db,write_question_bank(self.tmp.name))
         self.clock=Clock()
         self.e=Engine(self.db,self.clock)
         self.a=self.e.register(101,'Алиса')
@@ -116,6 +116,69 @@ class ScreenTests(unittest.TestCase):
         self.request(data='menu')
         self.assertEqual(sum(method=='sendMessage' for method,_ in self.client.calls),1)
         self.assertTrue(all('_panel_epoch' not in params for _,params in self.client.calls))
+
+    def test_solo_play_timeout_replay_and_cancel_share_one_screen(self):
+        self.request(text='/start')
+        message_id=self.current_id()
+        settings=self.request(data='solo')['text']
+        self.assertIn('Вопросов — 10',settings)
+        self.assertIn('Время на вопрос — 60 с',settings)
+        state=self.e.state(101)
+        token=state['token']
+        self.request(data=f"w:{token}:topic:{state['topics'].index('Информатика')}")
+        self.request(data=f'w:{token}:difficulty:easy')
+        self.request(data=f'w:{token}:count:5')
+        self.request(data=f'w:{token}:seconds:15')
+        self.assertIn('Вопрос 1 из 5',self.request(data=f'w:{token}:save:yes')['text'])
+
+        game=self.e.active(self.a['user_id'])
+        gid=game['game_id']
+        self.assertEqual((game['play_mode'],game['status']),('solo','in_progress'))
+        self.assertEqual(len(self.e.participants(gid)),1)
+        with self.assertRaisesRegex(RuleError,'Комната не найдена'):
+            self.e.join(self.b['user_id'],game['game_code'])
+        questions=self.e.all('SELECT * FROM game_questions WHERE game_id=? ORDER BY position',(gid,))
+        self.assertEqual(len({q['question_id'] for q in questions}),5)
+        for q in questions[:-1]:
+            self.assertEqual((q['topic_snapshot'],q['difficulty_snapshot']),('Информатика','easy'))
+            payload=self.request(data=f"a:{gid}:{q['position']}:{q['correct_answer_snapshot']}")
+            self.assertIn(f"Вопрос {q['position']+1} из 5",payload['text'])
+        self.clock.advance(15)
+        self.flush()
+        result=self.current()
+        self.assertIn('Верных ответов — 4 из 5',result['text'])
+        self.assertIn('Очки — 60 из 75 возможных',result['text'])
+        self.assertEqual(self.e.one('SELECT answer_status FROM answers WHERE game_id=? AND question_position=5',
+                                    (gid,))[0],'timed_out')
+        self.assertFalse(self.e.leaderboard(0,self.clock()+1))
+
+        replay,menu=result['reply_markup']['inline_keyboard'][0]
+        self.assertEqual((replay['text'],menu['text']),('Сыграть ещё','Меню'))
+        self.assertIn('Вопрос 1 из 5',self.request(data=replay['callback_data'])['text'])
+        repeat=self.e.active(self.a['user_id'])
+        self.assertNotEqual(repeat['game_code'],game['game_code'])
+        for field in ('topic','difficulty','question_count','question_time_limit_seconds'):
+            self.assertEqual(repeat[field],game[field])
+
+        prompt=self.request(data='leave')
+        self.assertIn('будет отмечена как отменённая',prompt['text'])
+        self.assertIn('Вопрос 1 из 5',self.request(data='room')['text'])
+        prompt=self.request(data='leave')
+        confirm=prompt['reply_markup']['inline_keyboard'][0][0]['callback_data']
+        self.assertIn('Одиночная игра отменена',self.request(data=confirm)['text'])
+        history=self.request(data='history:0')['text']
+        self.assertIn('Одиночная · Завершена · 60 очков',history)
+        self.assertIn('Одиночная · Отменена',history)
+        self.assertEqual(self.current_id(),message_id)
+
+    def test_solo_offers_only_five_questions_when_seven_are_available(self):
+        self.db.execute('UPDATE questions SET is_active=0 WHERE question_id>7')
+        self.request(text='/start')
+        view=self.request(data='solo')
+        self.assertIn('Вопросов — 5',view['text'])
+        counts=[button['text'] for row in view['reply_markup']['inline_keyboard'] for button in row
+                if ':count:' in button['callback_data']]
+        self.assertEqual(counts,['5 вопр.'])
 
     def test_monthly_leaderboard_uses_finished_games_and_shares_places(self):
         carol=self.e.register(303,'Вера')['user_id']

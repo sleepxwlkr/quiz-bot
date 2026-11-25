@@ -2,10 +2,11 @@ import json
 import sqlite3
 from pathlib import Path
 
-from .migrations import upgrade_question_schema, upgrade_to_v4
+from .migrations import upgrade_schema, upgrade_to_v4
 from .questions import validate_question
 
 ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_QUESTION_BANK = ROOT / 'data' / 'questions.json'
 
 
 def connect(path):
@@ -17,7 +18,7 @@ def connect(path):
     db.execute('PRAGMA journal_mode=WAL')
     db.create_function('quiz_casefold', 1, str.casefold)
     version = db.execute('PRAGMA user_version').fetchone()[0]
-    if version not in (0, 1, 2, 3, 4, 5, 6, 7):
+    if version not in (0, 1, 2, 3, 4, 5, 6, 7, 8):
         raise RuntimeError('Unsupported database version: %s' % version)
     if version == 0 and db.execute("SELECT 1 FROM sqlite_master WHERE name='users'").fetchone():
         raise RuntimeError('Old draft database detected. Use a new DATABASE_PATH; keep the old file as a backup.')
@@ -25,8 +26,8 @@ def connect(path):
     try:
         if version in (1,2,3):
             upgrade_to_v4(db,path,schema)
-        elif version in (4,5,6):
-            upgrade_question_schema(db,schema,version)
+        elif version in (4,5,6,7):
+            upgrade_schema(db,schema,version)
         else:
             db.executescript(schema)
     except Exception:
@@ -43,7 +44,7 @@ def connect(path):
 
 
 def seed_questions(db, filename=None):
-    data = json.loads(Path(filename or ROOT / 'data' / 'questions.json').read_text(encoding='utf-8'))
+    data = json.loads(Path(filename or DEFAULT_QUESTION_BANK).read_text(encoding='utf-8'))
     if not isinstance(data, list):
         raise ValueError('The question file must contain a JSON array.')
     keys = set()
@@ -84,4 +85,6 @@ def seed_questions(db, filename=None):
 def initialize_question_bank(db):
     """Seed a new bank and report how many questions are visible in it."""
     stored, deleted = db.execute('SELECT COUNT(*),COUNT(deleted_at) FROM questions').fetchone()
-    return stored-deleted if stored else seed_questions(db)
+    if stored or not DEFAULT_QUESTION_BANK.is_file():
+        return stored-deleted
+    return seed_questions(db)

@@ -14,6 +14,20 @@ from quizbot.__main__ import Runner
 from quizbot.telegram import TelegramError
 
 
+def write_question_bank(directory):
+    questions = []
+    for prefix,topic in (('it','Информатика'),('geo','География')):
+        for difficulty in ('easy','medium','hard'):
+            for number in range(1,11):
+                key = f'{prefix}-{difficulty[0]}{number:02}'
+                text = 'Сколько битов в одном байте?' if key=='it-e01' else f'Тестовый вопрос {key}'
+                questions.append(dict(key=key,topic=topic,difficulty=difficulty,text=text,
+                                      options=['8','2','4','16'],correct=0))
+    path = Path(directory)/'questions.json'
+    path.write_text(json.dumps(questions,ensure_ascii=False),encoding='utf-8')
+    return path
+
+
 class Clock:
     def __init__(self):
         self.now=1700000000.0
@@ -42,7 +56,8 @@ class BotTests(unittest.TestCase):
         self.tmp=tempfile.TemporaryDirectory()
         self.path=Path(self.tmp.name)/'test.db'
         self.db=connect(self.path)
-        seed_questions(self.db)
+        self.bank_path=write_question_bank(self.path.parent)
+        seed_questions(self.db,self.bank_path)
         self.clock=Clock()
         self.e=Engine(self.db,self.clock)
         self.runners=[]
@@ -55,8 +70,8 @@ class BotTests(unittest.TestCase):
         self.db.close()
         self.tmp.cleanup()
 
-    def runner(self,client):
-        runner=Runner(self.db,client,'test_bot')
+    def runner(self,client,admin_ids=()):
+        runner=Runner(self.db,client,'test_bot',admin_ids=admin_ids)
         self.runners.append(runner)
         return runner
 
@@ -94,7 +109,7 @@ class BotTests(unittest.TestCase):
             self.e.register(303,'<a>')
 
     def test_bank_and_seed_idempotence(self):
-        seed_questions(self.db)
+        seed_questions(self.db,self.bank_path)
         self.assertEqual(self.e.one('SELECT COUNT(*) FROM questions')[0],60)
         self.assertEqual(len(self.e.available_questions('Информатика','hard')),10)
         self.assertEqual(len(self.e.available_questions('География','easy')),10)
@@ -488,7 +503,31 @@ class BotTests(unittest.TestCase):
         self.assertIsNone(self.e.one('SELECT 1 FROM outbox'))
         self.assertEqual(self.e.state(303),{})
         self.assertEqual(self.e.one("SELECT value FROM settings WHERE key='update_offset:default'")[0],'25')
+        self.assertFalse(runner.client.calls)
         self.assertGreater(self.e.create(self.a['user_id'],'Все темы','mixed',5,60),lobby)
+
+    def test_lifecycle_notifies_admins_even_if_one_chat_is_unavailable(self):
+        client=FakeClient()
+        runner=self.runner(client,admin_ids=('101','202','202'))
+        attempts=[]
+
+        def send(method, **params):
+            attempts.append((method,params['chat_id'],params['text']))
+            if params['chat_id']=='101':
+                raise TelegramError(403,'Forbidden')
+            return {'message_id':1}
+
+        with patch.object(client,'call',side_effect=send), patch.object(runner,'_poll'), \
+                patch.object(runner,'deliver',side_effect=KeyboardInterrupt), self.assertLogs('quizbot'):
+            with self.assertRaises(KeyboardInterrupt):
+                runner.run()
+
+        self.assertEqual(attempts, [
+            ('sendMessage','101','🟢 Бот @test_bot запущен.'),
+            ('sendMessage','202','🟢 Бот @test_bot запущен.'),
+            ('sendMessage','101','🔴 Бот @test_bot остановлен.'),
+            ('sendMessage','202','🔴 Бот @test_bot остановлен.'),
+        ])
 
     def test_wizard_and_questions_edit_one_persistent_message(self):
         client=FakeClient()

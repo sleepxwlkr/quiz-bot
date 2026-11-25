@@ -1,4 +1,4 @@
--- SQLite, schema version 7. Times are UTC Unix seconds.
+-- SQLite, schema version 8. Times are UTC Unix seconds.
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS games (
     finished_at REAL,
     lobby_expires_at REAL NOT NULL,
     hard_deadline_at REAL,
+    play_mode TEXT NOT NULL DEFAULT 'room' CHECK(play_mode IN ('room','solo')),
     CHECK(status <> 'completed' OR finished_at IS NOT NULL)
 );
 CREATE TABLE IF NOT EXISTS game_participants (
@@ -144,4 +145,4 @@ CREATE TABLE IF NOT EXISTS ui_messages (
     message_id INTEGER NOT NULL,
     PRIMARY KEY(chat_id,slot)
 );
-PRAGMA user_version = 7;
+PRAGMA user_version = 8;
